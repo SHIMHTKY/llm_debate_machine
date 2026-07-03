@@ -21,8 +21,9 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config.settings import load_settings_for_frontend, save_settings_for_frontend
 from ..storage.sessions import SessionStore
+from .detail_views import build_message_detail_view
 from .manager import DebateCapacityError, DebateResumeError, DebateRunManager, DebateStateError
-from .schemas import DebateRewindRequest, DebateStartRequest, DebateTitleUpdateRequest, DebateUserMessageRequest
+from .schemas import DebateRewindRequest, DebateStartRequest, DebateTitleUpdateRequest, DebateUserMessageRequest, MessageDetailViewRequest
 
 # 项目根目录，用来定位前端静态资源。
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -205,6 +206,12 @@ def create_app() -> FastAPI:
         if session is None:
             raise HTTPException(status_code=404, detail="未找到该辩论记录。")
         return session
+
+    @app.post("/api/debates/{session_id}/message-detail-view")
+    async def create_message_detail_view(session_id: str, payload: MessageDetailViewRequest) -> dict[str, Any]:
+        """Generate or read cached translation / summary for a message detail text block."""
+
+        return await build_message_detail_view(store, session_id, payload)
 
     @app.post("/api/debates/{session_id}/archive")
     async def archive_debate(session_id: str) -> dict[str, Any]:

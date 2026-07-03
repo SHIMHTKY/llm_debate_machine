@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Debate Studio</title>
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=20260326-favicon" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260701-opaque-settings-modal" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260704-detail-text-actions-4" />
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -266,6 +266,21 @@
       </div>
     </div>
 
+    <div id="messageDetailModal" class="modal hidden">
+      <div class="modal-card message-detail-modal-card panel">
+        <div class="message-detail-toolbar">
+          <div class="message-detail-title">
+            <p id="messageDetailEyebrow" class="eyebrow">Call Details</p>
+            <h3 id="messageDetailTitle">调用细节</h3>
+          </div>
+          <div class="message-detail-actions">
+            <button id="closeMessageDetailBtn" class="ghost-button compact-button" type="button">关闭</button>
+          </div>
+        </div>
+        <div id="messageDetailBody" class="message-detail-body"></div>
+      </div>
+    </div>
+
     <div id="settingsModal" class="modal hidden">
       <div class="modal-card panel">
         <div class="panel-head modal-head">
@@ -320,6 +335,6 @@
       </div>
     </div>
 
-    <script defer src="/assets/app.js?v=20260701-opaque-settings-modal"></script>
+    <script defer src="/assets/app.js?v=20260704-detail-text-actions-4"></script>
   </body>
 </html>

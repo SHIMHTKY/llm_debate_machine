@@ -23,6 +23,15 @@ MAX_MODEL_SUPPLIERS = 24
 MAX_TOOL_CONFIGS = 12
 VALID_TOOL_TYPES = {"tavily_search"}
 DEFAULT_TAVILY_TOOL_ID = "tool_tavily_search"
+DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS = 2500
+MIN_TOOL_OUTPUT_TRUNCATE_CHARS = 500
+MAX_TOOL_OUTPUT_TRUNCATE_CHARS = 20000
+
+
+def _normalize_tool_output_truncate_chars(value: Any, fallback: Any = DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS) -> int:
+    fallback_value = _positive_int(fallback, DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS)
+    parsed = _positive_int(value, fallback_value)
+    return max(MIN_TOOL_OUTPUT_TRUNCATE_CHARS, min(parsed, MAX_TOOL_OUTPUT_TRUNCATE_CHARS))
 
 
 def _normalize_search_settings(
@@ -42,7 +51,12 @@ def _normalize_search_settings(
         "timeout": _positive_int(search.get("timeout"), defaults["timeout"]),
         "max_results": _positive_int(search.get("max_results"), defaults["max_results"]),
         "search_depth": _text(search.get("search_depth"), defaults["search_depth"]) or defaults["search_depth"],
+        "output_truncate_chars": _normalize_tool_output_truncate_chars(
+            search.get("output_truncate_chars"),
+            defaults.get("output_truncate_chars", DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS),
+        ),
         "max_tool_rounds": _positive_int(search.get("max_tool_rounds"), defaults.get("max_tool_rounds", 2)),
+        "fallback_enabled": _coerce_bool(search.get("fallback_enabled"), _coerce_bool(defaults.get("fallback_enabled"), False)),
     }
 
 
@@ -165,6 +179,10 @@ def _normalize_tool_config(
         "timeout": _positive_int(tool.get("timeout"), _positive_int(defaults.get("timeout"), 60)),
         "max_results": max(1, min(_positive_int(tool.get("max_results"), _positive_int(defaults.get("max_results"), 5)), 10)),
         "search_depth": _text(tool.get("search_depth"), defaults.get("search_depth", "advanced")) or "advanced",
+        "output_truncate_chars": _normalize_tool_output_truncate_chars(
+            tool.get("output_truncate_chars"),
+            defaults.get("output_truncate_chars", DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS),
+        ),
     }
 
 
@@ -224,6 +242,13 @@ def _normalize_tool_selection(
     if legacy and not selection:
         max_tool_rounds = _positive_int(legacy.get("max_tool_rounds"), max_tool_rounds)
 
+    fallback_enabled = _coerce_bool(
+        selection.get("fallback_enabled"),
+        _coerce_bool(existing_selection.get("fallback_enabled"), _coerce_bool(defaults.get("fallback_enabled"), False)),
+    )
+    if legacy and not selection:
+        fallback_enabled = _coerce_bool(legacy.get("fallback_enabled"), fallback_enabled)
+
     enabled_ids_source = selection.get("enabled_tool_ids", existing_selection.get("enabled_tool_ids", []))
     if not isinstance(enabled_ids_source, list):
         enabled_ids_source = []
@@ -242,6 +267,7 @@ def _normalize_tool_selection(
         "enabled_tool_ids": enabled_tool_ids,
         "mode": mode,
         "max_tool_rounds": max_tool_rounds,
+        "fallback_enabled": fallback_enabled,
     }
 
 
@@ -363,6 +389,7 @@ def _tool_key_from_search(search: dict[str, Any]) -> tuple[Any, ...]:
         _positive_int(normalized.get("timeout"), 60),
         _positive_int(normalized.get("max_results"), 5),
         _text(normalized.get("search_depth"), "advanced"),
+        _normalize_tool_output_truncate_chars(normalized.get("output_truncate_chars")),
     )
 
 
@@ -376,6 +403,7 @@ def _search_has_tool_config(search: Any) -> bool:
             "timeout" in search,
             "max_results" in search,
             "search_depth" in search,
+            "output_truncate_chars" in search,
         ]
     )
 
@@ -392,6 +420,7 @@ def _tool_from_search(search: dict[str, Any], index: int) -> dict[str, Any]:
         "timeout": _positive_int(normalized.get("timeout"), 60),
         "max_results": max(1, min(_positive_int(normalized.get("max_results"), 5), 10)),
         "search_depth": _text(normalized.get("search_depth"), "advanced") or "advanced",
+        "output_truncate_chars": _normalize_tool_output_truncate_chars(normalized.get("output_truncate_chars")),
     }
 
 
@@ -415,6 +444,7 @@ def _migrate_preset_searches_to_tools(payload: dict[str, Any]) -> dict[str, Any]
                     _positive_int(tool.get("timeout"), 60),
                     _positive_int(tool.get("max_results"), 5),
                     _text(tool.get("search_depth"), "advanced"),
+                    _normalize_tool_output_truncate_chars(tool.get("output_truncate_chars")),
                 )
                 tool_id_by_key[key] = _text(tool.get("id"))
 
@@ -623,6 +653,8 @@ def normalize_settings(
     payload = _prepare_payload(raw_settings)
 
     judge_source = payload["judge"] if isinstance(payload.get("judge"), dict) else base["judge"]
+    translator_source = payload["translator"] if isinstance(payload.get("translator"), dict) else base.get("translator", defaults["translator"])
+    summarizer_source = payload["summarizer"] if isinstance(payload.get("summarizer"), dict) else base.get("summarizer", defaults["summarizer"])
     suppliers_source = payload["model_suppliers"] if "model_suppliers" in payload else base.get("model_suppliers", defaults["model_suppliers"])
     normalized_suppliers = _normalize_model_suppliers(
         suppliers_source,
@@ -661,6 +693,18 @@ def normalize_settings(
             normalized_suppliers,
             strict_extra_body=strict_extra_body,
         ),
+        "translator": _normalize_judge_settings(
+            translator_source,
+            base.get("translator", defaults["translator"]),
+            normalized_suppliers,
+            strict_extra_body=strict_extra_body,
+        ),
+        "summarizer": _normalize_judge_settings(
+            summarizer_source,
+            base.get("summarizer", defaults["summarizer"]),
+            normalized_suppliers,
+            strict_extra_body=strict_extra_body,
+        ),
         "model_suppliers": normalized_suppliers,
         "tool_configs": normalized_tools,
         "debater_presets": normalized_presets,
@@ -693,6 +737,7 @@ def _resolve_search_from_tool_selection(
     if mode not in VALID_TOOL_MODES:
         mode = default_search["mode"]
     max_tool_rounds = _positive_int(selection.get("max_tool_rounds"), default_search["max_tool_rounds"])
+    fallback_enabled = _coerce_bool(selection.get("fallback_enabled"), _coerce_bool(default_search.get("fallback_enabled"), False))
 
     if not selected_tool:
         return {
@@ -701,6 +746,8 @@ def _resolve_search_from_tool_selection(
             "mode": mode,
             "api_key": "",
             "max_tool_rounds": max_tool_rounds,
+            "fallback_enabled": fallback_enabled,
+            "output_truncate_chars": default_search["output_truncate_chars"],
             "tool_ids": [_text(tool_id) for tool_id in enabled_tool_ids if _text(tool_id)],
         }
 
@@ -711,7 +758,12 @@ def _resolve_search_from_tool_selection(
         "timeout": _positive_int(selected_tool.get("timeout"), default_search["timeout"]),
         "max_results": max(1, min(_positive_int(selected_tool.get("max_results"), default_search["max_results"]), 10)),
         "search_depth": _text(selected_tool.get("search_depth"), default_search["search_depth"]) or default_search["search_depth"],
+        "output_truncate_chars": _normalize_tool_output_truncate_chars(
+            selected_tool.get("output_truncate_chars"),
+            default_search["output_truncate_chars"],
+        ),
         "max_tool_rounds": max_tool_rounds,
+        "fallback_enabled": fallback_enabled,
         "tool_id": selected_tool.get("id"),
         "tool_name": selected_tool.get("name"),
         "tool_template_id": selected_tool.get("template_id"),
@@ -803,6 +855,8 @@ def _resolve_runtime_settings(raw_settings: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "judge": _merge_supplier_with_judge(deepcopy(normalized.get("judge") or defaults["judge"]), suppliers_by_id, fallback_supplier),
+        "translator": _merge_supplier_with_judge(deepcopy(normalized.get("translator") or defaults["translator"]), suppliers_by_id, fallback_supplier),
+        "summarizer": _merge_supplier_with_judge(deepcopy(normalized.get("summarizer") or defaults["summarizer"]), suppliers_by_id, fallback_supplier),
         "pro": _merge_supplier_with_preset(pro_preset, suppliers_by_id, fallback_supplier, tools_by_id),
         "con": _merge_supplier_with_preset(con_preset, suppliers_by_id, fallback_supplier, tools_by_id),
         "model_suppliers": deepcopy(suppliers),

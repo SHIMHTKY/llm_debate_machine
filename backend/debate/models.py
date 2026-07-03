@@ -55,17 +55,75 @@ def _normalize_chat_response_payload(response: Any) -> Any:
             suffix = "..." if len(text) > 400 else ""
             raise ValueError(f"模型返回了非 JSON 字符串响应，无法解析：{preview}{suffix}") from exc
 
+    if hasattr(response, "model_dump"):
+        try:
+            return response.model_dump()
+        except Exception:
+            pass
+
+    if hasattr(response, "dict"):
+        try:
+            return response.dict()
+        except Exception:
+            pass
+
     return response
+
+
+REASONING_MESSAGE_FIELDS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_details",
+    "reasoning_summary",
+    "thinking",
+    "thinking_content",
+    "thought",
+    "thoughts",
+)
+
+
+def _attach_reasoning_fields(chat_result: Any, response_payload: Any) -> Any:
+    """Preserve provider-specific reasoning fields that LangChain may drop."""
+
+    if not isinstance(response_payload, dict):
+        return chat_result
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list):
+        return chat_result
+    generations = getattr(chat_result, "generations", None)
+    if not isinstance(generations, list):
+        return chat_result
+
+    for generation, choice in zip(generations, choices):
+        if not isinstance(choice, dict):
+            continue
+        raw_message = choice.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        reasoning_payload = {
+            field: raw_message[field]
+            for field in REASONING_MESSAGE_FIELDS
+            if raw_message.get(field) not in (None, "")
+        }
+        if not reasoning_payload:
+            continue
+        message = getattr(generation, "message", None)
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if isinstance(additional_kwargs, dict):
+            additional_kwargs.update({key: value for key, value in reasoning_payload.items() if key not in additional_kwargs})
+    return chat_result
 
 
 class CompatibleChatOpenAI(ChatOpenAI):
     def _create_chat_result(self, response: Any, generation_info: dict | None = None):
-        return super()._create_chat_result(_normalize_chat_response_payload(response), generation_info)
+        payload = _normalize_chat_response_payload(response)
+        return _attach_reasoning_fields(super()._create_chat_result(payload, generation_info), payload)
 
 
 class CompatibleAzureChatOpenAI(AzureChatOpenAI):
     def _create_chat_result(self, response: Any, generation_info: dict | None = None):
-        return super()._create_chat_result(_normalize_chat_response_payload(response), generation_info)
+        payload = _normalize_chat_response_payload(response)
+        return _attach_reasoning_fields(super()._create_chat_result(payload, generation_info), payload)
 
 
 def build_llm(model_settings: dict[str, Any]):

@@ -45,6 +45,8 @@ def settings_for_frontend(raw_settings: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "judge": _frontend_model(raw_settings["judge"], include_search=False),
+        "translator": _frontend_model(raw_settings["translator"], include_search=False),
+        "summarizer": _frontend_model(raw_settings["summarizer"], include_search=False),
         "model_suppliers": [
             _frontend_supplier(supplier)
             for supplier in raw_settings.get("model_suppliers", [])
@@ -117,7 +119,9 @@ def public_settings_summary(settings: dict[str, Any]) -> dict[str, Any]:
                 "has_api_key": bool(_text(search.get("api_key"))),
                 "max_results": search.get("max_results"),
                 "search_depth": search.get("search_depth"),
+                "output_truncate_chars": search.get("output_truncate_chars"),
                 "max_tool_rounds": search.get("max_tool_rounds"),
+                "fallback_enabled": bool(search.get("fallback_enabled")),
                 "tool_id": search.get("tool_id"),
                 "tool_name": search.get("tool_name"),
                 "tool_template_id": search.get("tool_template_id"),
@@ -130,6 +134,8 @@ def public_settings_summary(settings: dict[str, Any]) -> dict[str, Any]:
         "context_rounds": _normalize_context_rounds(settings.get("context_rounds"), DEFAULT_CONTEXT_ROUNDS),
         "usage_tracking_enabled": _coerce_bool(settings.get("usage_tracking_enabled"), False),
         "judge": summarize("judge", settings.get("judge", {})),
+        "translator": summarize("translator", settings.get("translator", {})),
+        "summarizer": summarize("summarizer", settings.get("summarizer", {})),
         "pro": summarize("pro", settings.get("pro", {})),
         "con": summarize("con", settings.get("con", {})),
     }

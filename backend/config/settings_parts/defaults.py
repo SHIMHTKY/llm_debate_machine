@@ -16,7 +16,9 @@ def _default_search() -> dict[str, Any]:
         "timeout": 60,
         "max_results": 5,
         "search_depth": "advanced",
+        "output_truncate_chars": 2500,
         "max_tool_rounds": 2,
+        "fallback_enabled": False,
     }
 
 
@@ -32,6 +34,7 @@ def _default_tool_config() -> dict[str, Any]:
         "timeout": search["timeout"],
         "max_results": search["max_results"],
         "search_depth": search["search_depth"],
+        "output_truncate_chars": search["output_truncate_chars"],
     }
 
 
@@ -40,6 +43,7 @@ def _default_tool_selection() -> dict[str, Any]:
         "enabled_tool_ids": [],
         "mode": "bind_tools",
         "max_tool_rounds": 2,
+        "fallback_enabled": False,
     }
 
 
@@ -129,6 +133,8 @@ def default_settings() -> dict[str, Any]:
     ]
     return {
         "judge": _judge_from_model(judge_defaults, judge_supplier["id"]),
+        "translator": _judge_from_model(judge_defaults, judge_supplier["id"]),
+        "summarizer": _judge_from_model(judge_defaults, judge_supplier["id"]),
         "model_suppliers": suppliers,
         "tool_configs": [_default_tool_config()],
         "debater_presets": presets,

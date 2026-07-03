@@ -23,6 +23,7 @@ const TOOL_TEMPLATES = [
       timeout: 60,
       max_results: 5,
       search_depth: "advanced",
+      output_truncate_chars: 2500,
     },
   },
 ];
@@ -30,6 +31,11 @@ const CONFIG_MANAGER_TABS = [
   { id: "supplier", label: "配置供应商", listTitle: "供应商列表", countLabel: "供应商" },
   { id: "tool", label: "配置工具", listTitle: "工具列表", countLabel: "工具" },
   { id: "debater", label: "配置辩手", listTitle: "辩手列表", countLabel: "辩手" },
+];
+const UTILITY_MODEL_TABS = [
+  { id: "judge", label: "裁判模型", note: "裁判也从供应商中选择接入信息，只在这里填写模型和裁判专属参数。", supplierLabel: "裁判供应商" },
+  { id: "translator", label: "翻译模型", note: "预留给后续翻译功能使用，配置方式与裁判模型一致，目前暂不参与辩论流程。", supplierLabel: "翻译供应商" },
+  { id: "summarizer", label: "总结模型", note: "预留给后续总结功能使用，配置方式与裁判模型一致，目前暂不参与辩论流程。", supplierLabel: "总结供应商" },
 ];
 const MIN_DEBATE_ROUNDS = 2;
 const MAX_DEBATE_ROUNDS = 10;
@@ -52,8 +58,11 @@ const state = {
   selectedPresetEditorId: "",
   selectedSupplierId: "",
   selectedToolConfigId: "",
+  activeUtilityModelKey: "judge",
+  utilityModelSwitcherOpen: false,
   presetManagerOpen: false,
   presetManagerTab: "debater",
+  expandedToolChoiceIds: {},
   noticeText: "",
   workspaceText: "",
   darkMode: false,
@@ -71,6 +80,9 @@ const state = {
   archivedModalTimer: null,
   markdownPreviewModalTimer: null,
   markdownPreview: null,
+  messageDetailModalTimer: null,
+  messageDetailLoadingKey: "",
+  messageDetail: null,
   sessionSummaryRefreshTimer: null,
   sessionSummaryRefreshInFlight: false,
   reviewTopicExpanded: false,
@@ -144,6 +156,11 @@ function cacheElements() {
   els.markdownPreviewEyebrow = document.getElementById("markdownPreviewEyebrow");
   els.markdownPreviewTitle = document.getElementById("markdownPreviewTitle");
   els.markdownPreviewViewer = document.getElementById("markdownPreviewViewer");
+  els.messageDetailModal = document.getElementById("messageDetailModal");
+  els.closeMessageDetailBtn = document.getElementById("closeMessageDetailBtn");
+  els.messageDetailEyebrow = document.getElementById("messageDetailEyebrow");
+  els.messageDetailTitle = document.getElementById("messageDetailTitle");
+  els.messageDetailBody = document.getElementById("messageDetailBody");
   els.titleEditModal = document.getElementById("titleEditModal");
   els.titleEditInput = document.getElementById("titleEditInput");
   els.cancelTitleEditBtn = document.getElementById("cancelTitleEditBtn");
@@ -204,6 +221,13 @@ function bindEvents() {
       closeMarkdownPreviewModal();
     }
   });
+  els.closeMessageDetailBtn.addEventListener("click", closeMessageDetailModal);
+  els.messageDetailModal.addEventListener("click", (event) => {
+    if (event.target === els.messageDetailModal) {
+      closeMessageDetailModal();
+    }
+  });
+  els.messageDetailBody.addEventListener("click", handleMessageDetailBodyClick);
   document.addEventListener("pointerdown", handleDocumentPointerDown);
   els.toggleUserTargetMenuBtn.addEventListener("click", toggleUserTargetMenu);
   els.userTargetMenuAnchor.addEventListener("pointerenter", cancelUserTargetSubmenuClose);
@@ -230,6 +254,11 @@ function bindEvents() {
     }
   });
   els.chatThread.addEventListener("click", async (event) => {
+    const detailAction = event.target.closest("[data-action='open-message-details']");
+    if (detailAction) {
+      openMessageDetails(detailAction.dataset.messageId);
+      return;
+    }
     const action = event.target.closest("[data-action='retract-user-message']");
     if (action) {
       await retractUserInterjection();
@@ -247,6 +276,11 @@ function bindEvents() {
     }
   });
   els.reviewThread.addEventListener("click", async (event) => {
+    const detailAction = event.target.closest("[data-action='open-message-details']");
+    if (detailAction) {
+      openMessageDetails(detailAction.dataset.messageId);
+      return;
+    }
     const rewindAction = event.target.closest("[data-action='rewind-message']");
     if (rewindAction) {
       await handleMessageRewindAction(rewindAction.dataset.messageId);
@@ -426,8 +460,12 @@ async function persistSettings() {
 
 function buildSettingsPayload() {
   const judge = state.settings?.judge || {};
+  const translator = state.settings?.translator || {};
+  const summarizer = state.settings?.summarizer || {};
   return {
-    judge: serializeJudgeSettings(judge),
+    judge: serializeJudgeSettings(judge, "裁判模型"),
+    translator: serializeJudgeSettings(translator, "翻译模型"),
+    summarizer: serializeJudgeSettings(summarizer, "总结模型"),
     model_suppliers: getModelSuppliers().slice(0, getSupplierLimit()).map((supplier) => serializeSupplierSettings(supplier)),
     tool_configs: getToolConfigs().slice(0, getToolLimit()).map((toolConfig) => serializeToolConfig(toolConfig)),
     pro_preset_id: state.settings?.pro_preset_id || "",
@@ -438,13 +476,13 @@ function buildSettingsPayload() {
   };
 }
 
-function serializeJudgeSettings(judge) {
+function serializeJudgeSettings(judge, label = "模型配置") {
   return {
     supplier_id: String(judge?.supplier_id || "").trim(),
     model: String(judge?.model || "").trim(),
     azure_deployment: String(judge?.azure_deployment || "").trim(),
     max_tokens: Number(judge?.max_tokens || 0),
-    extra_body: parseExtraBodyPayload(judge?.extra_body_input ?? judge?.extra_body, "裁判模型"),
+    extra_body: parseExtraBodyPayload(judge?.extra_body_input ?? judge?.extra_body, label),
   };
 }
 
@@ -485,6 +523,7 @@ function serializeToolConfig(toolConfig) {
     timeout: Number(toolConfig?.timeout || 0),
     max_results: Number(toolConfig?.max_results || 0),
     search_depth: String(toolConfig?.search_depth || "advanced").trim(),
+    output_truncate_chars: Number(toolConfig?.output_truncate_chars || 0),
   };
 }
 
@@ -497,6 +536,7 @@ function serializeToolSelection(selection) {
       .filter((toolId, index, arr) => toolId && availableIds.has(toolId) && arr.indexOf(toolId) === index),
     mode: String(selection?.mode || "bind_tools").trim(),
     max_tool_rounds: Number(selection?.max_tool_rounds || 0),
+    fallback_enabled: Boolean(selection?.fallback_enabled),
   };
 }
 
@@ -682,6 +722,8 @@ function ensureSelectedSupplierEditor(preferredId = "") {
     preferredId,
     state.selectedSupplierId,
     state.settings?.judge?.supplier_id,
+    state.settings?.translator?.supplier_id,
+    state.settings?.summarizer?.supplier_id,
     suppliers[0]?.id,
   ];
   state.selectedSupplierId = candidates.find((candidate) => supplierIds.has(String(candidate || ""))) || suppliers[0].id;
@@ -711,6 +753,23 @@ function ensurePresetManagerSelections() {
 
 function normalizeConfigManagerTab(tab) {
   return CONFIG_MANAGER_TABS.some((item) => item.id === tab) ? tab : "debater";
+}
+
+function normalizeUtilityModelKey(key) {
+  return UTILITY_MODEL_TABS.some((item) => item.id === key) ? key : "judge";
+}
+
+function getUtilityModelMeta(key = state.activeUtilityModelKey) {
+  const normalizedKey = normalizeUtilityModelKey(key);
+  return UTILITY_MODEL_TABS.find((item) => item.id === normalizedKey) || UTILITY_MODEL_TABS[0];
+}
+
+function getUtilityModelSettings(key = state.activeUtilityModelKey) {
+  const normalizedKey = normalizeUtilityModelKey(key);
+  if (!state.settings[normalizedKey] || typeof state.settings[normalizedKey] !== "object") {
+    state.settings[normalizedKey] = {};
+  }
+  return state.settings[normalizedKey];
 }
 
 function getPresetLimit() {
@@ -786,6 +845,7 @@ function createToolFromTemplate(templateId = "tavily_search") {
     timeout: Number(defaults.timeout || 60) || 60,
     max_results: Number(defaults.max_results || 5) || 5,
     search_depth: String(defaults.search_depth || "advanced"),
+    output_truncate_chars: Number(defaults.output_truncate_chars || 2500) || 2500,
   };
 }
 
@@ -807,6 +867,7 @@ function getPresetToolSelection(preset) {
     enabled_tool_ids: Array.isArray(selection.enabled_tool_ids) ? selection.enabled_tool_ids : [],
     mode: String(selection.mode || "bind_tools"),
     max_tool_rounds: Number(selection.max_tool_rounds || 2) || 2,
+    fallback_enabled: Boolean(selection.fallback_enabled),
   };
 }
 
@@ -870,12 +931,15 @@ function createEmptyDebaterPreset() {
       enabled_tool_ids: [...seedToolSelection.enabled_tool_ids],
       mode: seedToolSelection.mode,
       max_tool_rounds: seedToolSelection.max_tool_rounds,
+      fallback_enabled: seedToolSelection.fallback_enabled,
     },
   };
 }
 
 function openSettings() {
   state.presetManagerOpen = false;
+  state.activeUtilityModelKey = "judge";
+  state.utilityModelSwitcherOpen = false;
   ensurePresetManagerSelections();
   renderSettingsForm({ presetManagerOptions: { preserveListScroll: false, preserveEditorScroll: false } });
   window.clearTimeout(state.settingsModalTimer);
@@ -929,8 +993,9 @@ function renderSettingsForm(options = {}) {
     return;
   }
   ensurePresetManagerSelections();
+  state.activeUtilityModelKey = normalizeUtilityModelKey(state.activeUtilityModelKey);
   els.settingsForm.innerHTML = [
-    createJudgeSettingsCard(state.settings.judge || {}),
+    createJudgeSettingsCard(getUtilityModelSettings(state.activeUtilityModelKey), state.activeUtilityModelKey),
     createSettingsSideStack(),
   ].join("");
   renderPresetManagerPanel(options.presetManagerOptions || {});
@@ -1032,21 +1097,66 @@ function restoreScrollTop(element, requestedScrollTop) {
   element.scrollTop = Math.min(Math.max(0, requestedScrollTop), maxScrollTop);
 }
 
-function createJudgeSettingsCard(config) {
+function createUtilityModelSwitchMenu(activeKey) {
+  const options = UTILITY_MODEL_TABS.filter((item) => item.id !== activeKey);
+  return `
+    <div class="utility-model-menu ${state.utilityModelSwitcherOpen ? "" : "hidden"}">
+      ${options
+        .map(
+          (item) => `
+            <button class="utility-model-option" type="button" data-action="switch-utility-model" data-utility-model-key="${escapeAttribute(item.id)}">
+              <span>${escapeHtml(item.label)}</span>
+              <small>切换配置</small>
+            </button>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function getUtilityModelSwitchIconSvg() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M7 7h10" />
+      <path d="M14 4l3 3-3 3" />
+      <path d="M17 17H7" />
+      <path d="M10 14l-3 3 3 3" />
+    </svg>
+  `;
+}
+
+function createJudgeSettingsCard(config, modelKey = "judge") {
+  const activeKey = normalizeUtilityModelKey(modelKey);
+  const meta = getUtilityModelMeta(activeKey);
   const supplier = getJudgeSupplier(config);
   const provider = supplier?.provider === "azure" ? "azure" : "chatopenai";
   return `
-    <section class="settings-card judge-settings-card">
+    <section class="settings-card judge-settings-card utility-model-card">
+      <div class="utility-model-switcher">
+        <button
+          class="utility-model-switch-button"
+          type="button"
+          data-action="toggle-utility-model-switcher"
+          aria-label="切换模型配置"
+          aria-expanded="${state.utilityModelSwitcherOpen ? "true" : "false"}"
+        >
+          ${getUtilityModelSwitchIconSvg()}
+        </button>
+        ${createUtilityModelSwitchMenu(activeKey)}
+      </div>
       <div class="settings-card-head settings-card-head-compact">
         <div>
-          <h4>裁判模型</h4>
-          <p class="card-note">裁判也从供应商中选择接入信息，只在这里填写模型和裁判专属参数。</p>
+          <h4>${escapeHtml(meta.label)}</h4>
+          <p class="card-note">${escapeHtml(meta.note)}</p>
         </div>
+      </div>
+      <div class="utility-model-actions">
         <button class="ghost-button compact-button" type="button" data-action="open-preset-manager" data-preset-manager-tab="supplier">管理供应商</button>
       </div>
       <label>
-        <span>裁判供应商</span>
-        <select data-judge-field="supplier_id">
+        <span>${escapeHtml(meta.supplierLabel)}</span>
+        <select data-utility-model-key="${escapeAttribute(activeKey)}" data-utility-model-field="supplier_id">
           ${createSupplierOptions(config.supplier_id || supplier?.id || "")}
         </select>
       </label>
@@ -1057,24 +1167,24 @@ function createJudgeSettingsCard(config) {
       </div>
       <label>
         <span>模型名称</span>
-        <input data-judge-field="model" value="${escapeAttribute(config.model || "")}" placeholder="例如 gpt-5.2 / kimi-k2.5" />
+        <input data-utility-model-key="${escapeAttribute(activeKey)}" data-utility-model-field="model" value="${escapeAttribute(config.model || "")}" placeholder="例如 gpt-5.2 / kimi-k2.5" />
       </label>
       <div class="provider-fields ${provider === "chatopenai" ? "" : "hidden"}">
         <label>
           <span>额外参数 extra_body</span>
-          <textarea class="json-textarea" data-judge-field="extra_body" rows="4" spellcheck="false" placeholder='例如 {"enable_thinking": true}'>${escapeHtml(formatExtraBodyInput(config.extra_body_input ?? config.extra_body))}</textarea>
+          <textarea class="json-textarea" data-utility-model-key="${escapeAttribute(activeKey)}" data-utility-model-field="extra_body" rows="4" spellcheck="false" placeholder='例如 {"enable_thinking": true}'>${escapeHtml(formatExtraBodyInput(config.extra_body_input ?? config.extra_body))}</textarea>
         </label>
         <p class="card-note">仅在 ChatOpenAI 供应商下生效。支持标准 JSON，也兼容 {"enable_thinking": True} 这种写法。</p>
       </div>
       <div class="provider-fields ${provider === "azure" ? "" : "hidden"}">
         <label>
           <span>Azure Deployment</span>
-          <input data-judge-field="azure_deployment" value="${escapeAttribute(config.azure_deployment || "")}" placeholder="例如 my-deployment" />
+          <input data-utility-model-key="${escapeAttribute(activeKey)}" data-utility-model-field="azure_deployment" value="${escapeAttribute(config.azure_deployment || "")}" placeholder="例如 my-deployment" />
         </label>
       </div>
       <label>
         <span>Max Tokens</span>
-        <input data-judge-field="max_tokens" type="number" min="1" value="${escapeAttribute(config.max_tokens || 4096)}" />
+        <input data-utility-model-key="${escapeAttribute(activeKey)}" data-utility-model-field="max_tokens" type="number" min="1" value="${escapeAttribute(config.max_tokens || 4096)}" />
       </label>
     </section>
   `;
@@ -1174,7 +1284,7 @@ function describePreset(preset) {
   const selection = getPresetToolSelection(preset);
   const selectedTools = getPresetSelectedTools(preset).filter((toolConfig) => toolConfig.enabled);
   const toolLabel = selectedTools.length
-    ? `${selectedTools.map((toolConfig) => toolConfig.name || "未命名工具").join(" / ")} · ${selection.mode || "bind_tools"}`
+    ? `${selectedTools.map((toolConfig) => toolConfig.name || "未命名工具").join(" / ")} · ${selection.mode || "bind_tools"} · ${selection.fallback_enabled ? "兜底开" : "兜底关"}`
     : "无工具";
   return `${supplierLabel} · ${providerLabel} · ${modelLabel} · ${toolLabel}`;
 }
@@ -1503,6 +1613,10 @@ function createToolConfigForm(toolConfig) {
           <span>条数</span>
           <input data-tool-config-id="${escapeAttribute(toolConfig.id || "")}" data-tool-config-field="max_results" type="number" min="1" max="10" value="${escapeAttribute(toolConfig.max_results || 5)}" />
         </label>
+        <label>
+          <span>输出截断字符数</span>
+          <input data-tool-config-id="${escapeAttribute(toolConfig.id || "")}" data-tool-config-field="output_truncate_chars" type="number" min="500" max="20000" step="100" value="${escapeAttribute(toolConfig.output_truncate_chars || 2500)}" />
+        </label>
       </div>
       <label>
         <span>搜索深度</span>
@@ -1614,39 +1728,77 @@ function createPresetToolSelector(selection) {
           <p class="card-note">从通用工具配置中选择本辩手可调用的工具。未启用的通用工具即使勾选也不会执行。</p>
         </div>
       </div>
-      <div class="tool-choice-list">
-        ${tools.map((toolConfig) => createToolChoice(toolConfig, selectedIds.has(toolConfig.id))).join("") || '<div class="empty-state compact-empty-state">暂无通用工具，请先在上方配置 Tavily Search。</div>'}
+      <div class="tool-strategy-row">
+        <div class="form-grid compact-form-grid">
+          <label>
+            <span>工具模式</span>
+            <select data-preset-tool-field="mode">
+              <option value="bind_tools" ${selection.mode === "bind_tools" ? "selected" : ""}>bind_tools</option>
+              <option value="react" ${selection.mode === "react" ? "selected" : ""}>react</option>
+            </select>
+          </label>
+          <label>
+            <span>工具最多调用轮数</span>
+            <input data-preset-tool-field="max_tool_rounds" type="number" min="1" value="${escapeAttribute(selection.max_tool_rounds || 2)}" />
+          </label>
+        </div>
       </div>
-      <div class="form-grid">
-        <label>
-          <span>工具模式</span>
-          <select data-preset-tool-field="mode">
-            <option value="bind_tools" ${selection.mode === "bind_tools" ? "selected" : ""}>bind_tools</option>
-            <option value="react" ${selection.mode === "react" ? "selected" : ""}>react</option>
-          </select>
-        </label>
-        <label>
-          <span>工具最多调用轮数</span>
-          <input data-preset-tool-field="max_tool_rounds" type="number" min="1" value="${escapeAttribute(selection.max_tool_rounds || 2)}" />
-        </label>
+      <div class="tool-choice-list">
+        ${tools.map((toolConfig) => createToolChoice(toolConfig, selectedIds.has(toolConfig.id), selection)).join("") || '<div class="empty-state compact-empty-state">暂无通用工具，请先在上方配置 Tavily Search。</div>'}
       </div>
     </div>
   `;
 }
 
-function createToolChoice(toolConfig, selected) {
+function createToolChoice(toolConfig, selected, selection) {
   const disabledClass = toolConfig.enabled ? "" : "tool-choice-disabled";
   const template = getToolTemplate(toolConfig.template_id || toolConfig.type || "tavily_search");
   const typeLabel = template?.name || toolConfig.type || "未知工具";
   const keyLabel = toolConfig.has_api_key || toolConfig.api_key ? "已配置 Key" : "未配置 Key";
+  const toolId = String(toolConfig.id || "");
+  const expanded = Boolean(state.expandedToolChoiceIds[toolId]);
   return `
-    <label class="tool-choice-card ${disabledClass}">
-      <input class="checkbox" type="checkbox" data-preset-tool-id="${escapeAttribute(toolConfig.id || "")}" ${selected ? "checked" : ""} />
-      <span>
-        <strong>${escapeHtml(toolConfig.name || "Tavily Search")}</strong>
-        <small>${escapeHtml(typeLabel)} · ${toolConfig.enabled ? "通用已启用" : "通用未启用"} · ${escapeHtml(keyLabel)}</small>
-      </span>
-    </label>
+    <div class="tool-choice-card ${disabledClass} ${expanded ? "expanded" : ""}">
+      <div class="tool-choice-main">
+        <label class="tool-choice-check" aria-label="选择工具">
+          <input class="checkbox" type="checkbox" data-preset-tool-id="${escapeAttribute(toolId)}" ${selected ? "checked" : ""} />
+        </label>
+        <button class="tool-choice-summary" type="button" data-action="toggle-tool-choice-details" data-tool-id="${escapeAttribute(toolId)}" aria-expanded="${expanded ? "true" : "false"}">
+          <span>
+            <strong>${escapeHtml(toolConfig.name || "Tavily Search")}</strong>
+            <small>${escapeHtml(typeLabel)} · ${toolConfig.enabled ? "通用已启用" : "通用未启用"} · ${escapeHtml(keyLabel)}</small>
+          </span>
+          <span class="tool-choice-caret" aria-hidden="true">${expanded ? "收起" : "展开"}</span>
+        </button>
+      </div>
+      ${expanded ? createToolChoiceDetails(toolConfig, typeLabel, keyLabel, selection) : ""}
+    </div>
+  `;
+}
+
+function createToolChoiceDetails(toolConfig, typeLabel, keyLabel, selection) {
+  const statusLabel = toolConfig.enabled ? "通用已启用" : "通用未启用";
+  const truncateChars = Number(toolConfig.output_truncate_chars || 2500) || 2500;
+  return `
+    <div class="tool-choice-details">
+      <div><span>工具模板</span><strong>${escapeHtml(typeLabel)}</strong></div>
+      <div><span>启用状态</span><strong>${escapeHtml(statusLabel)}</strong></div>
+      <div><span>API Key</span><strong>${escapeHtml(keyLabel)}</strong></div>
+      <div><span>超时</span><strong>${escapeHtml(String(toolConfig.timeout || 60))} 秒</strong></div>
+      <div><span>返回条数</span><strong>${escapeHtml(String(toolConfig.max_results || 5))}</strong></div>
+      <div><span>搜索深度</span><strong>${escapeHtml(toolConfig.search_depth || "advanced")}</strong></div>
+      <div><span>输出截断</span><strong>${escapeHtml(String(truncateChars))} 字符</strong></div>
+      <div class="toggle-row tool-choice-fallback-row">
+        <div>
+          <strong>后端兜底搜索</strong>
+          <p class="card-note">开启后，模型未调用搜索工具或搜索工具协议失败时，后端会自动搜索一轮；关闭后完全由模型自行决定是否调用搜索工具。</p>
+        </div>
+        <label class="mini-switch" aria-label="后端兜底搜索开关">
+          <input type="checkbox" data-preset-tool-field="fallback_enabled" ${selection.fallback_enabled ? "checked" : ""} />
+          <span></span>
+        </label>
+      </div>
+    </div>
   `;
 }
 
@@ -1677,6 +1829,18 @@ function handleSettingsFormClick(event) {
   }
   if (actionTarget.dataset.action === "open-preset-manager") {
     openPresetManager(actionTarget.dataset.presetManagerTab || "debater");
+    return;
+  }
+  if (actionTarget.dataset.action === "toggle-utility-model-switcher") {
+    state.utilityModelSwitcherOpen = !state.utilityModelSwitcherOpen;
+    actionTarget.setAttribute("aria-expanded", state.utilityModelSwitcherOpen ? "true" : "false");
+    actionTarget.closest(".utility-model-switcher")?.querySelector(".utility-model-menu")?.classList.toggle("hidden", !state.utilityModelSwitcherOpen);
+    return;
+  }
+  if (actionTarget.dataset.action === "switch-utility-model") {
+    state.activeUtilityModelKey = normalizeUtilityModelKey(actionTarget.dataset.utilityModelKey || "");
+    state.utilityModelSwitcherOpen = false;
+    renderSettingsForm();
   }
 }
 
@@ -1772,6 +1936,17 @@ function handlePresetManagerClick(event) {
     renderPresetManagerPanel({ preserveListScroll: true, preserveEditorScroll: false });
     return;
   }
+  if (action === "toggle-tool-choice-details") {
+    const toolId = actionTarget.dataset.toolId || "";
+    if (toolId) {
+      state.expandedToolChoiceIds = {
+        ...state.expandedToolChoiceIds,
+        [toolId]: !state.expandedToolChoiceIds[toolId],
+      };
+      renderPresetManagerPanel({ preserveListScroll: true, preserveEditorScroll: true });
+    }
+    return;
+  }
   if (action === "delete-preset") {
     deleteSelectedPreset();
     return;
@@ -1818,14 +1993,16 @@ function applySettingsInput(target) {
     return false;
   }
 
-  const judgeField = target.dataset.judgeField;
-  if (judgeField) {
-    if (judgeField === "extra_body") {
-      state.settings.judge.extra_body_input = String(target.value || "");
+  const utilityModelField = target.dataset.utilityModelField || target.dataset.judgeField;
+  if (utilityModelField) {
+    const modelKey = normalizeUtilityModelKey(target.dataset.utilityModelKey || "judge");
+    const modelConfig = getUtilityModelSettings(modelKey);
+    if (utilityModelField === "extra_body") {
+      modelConfig.extra_body_input = String(target.value || "");
       return false;
     }
-    state.settings.judge[judgeField] = readFieldValue(target);
-    return judgeField === "supplier_id";
+    modelConfig[utilityModelField] = readFieldValue(target);
+    return utilityModelField === "supplier_id";
   }
 
   const bindingField = target.dataset.bindingField;
@@ -1914,10 +2091,12 @@ function createSupplier() {
   state.settings.model_suppliers = [...suppliers, nextSupplier];
   state.selectedSupplierId = nextSupplier.id;
   state.presetManagerTab = "supplier";
-  if (!state.settings.judge?.supplier_id) {
-    state.settings.judge = state.settings.judge || {};
-    state.settings.judge.supplier_id = nextSupplier.id;
-  }
+  UTILITY_MODEL_TABS.forEach((item) => {
+    const modelConfig = getUtilityModelSettings(item.id);
+    if (!modelConfig.supplier_id) {
+      modelConfig.supplier_id = nextSupplier.id;
+    }
+  });
   getDebaterPresets().forEach((preset) => {
     if (!preset.supplier_id) {
       preset.supplier_id = nextSupplier.id;
@@ -1945,10 +2124,12 @@ function deleteSupplier(supplierId) {
   state.settings.model_suppliers = remaining;
   state.selectedSupplierId = replacementId;
   state.presetManagerTab = "supplier";
-  if (state.settings.judge?.supplier_id === supplier.id || !state.settings.judge?.supplier_id) {
-    state.settings.judge = state.settings.judge || {};
-    state.settings.judge.supplier_id = replacementId;
-  }
+  UTILITY_MODEL_TABS.forEach((item) => {
+    const modelConfig = getUtilityModelSettings(item.id);
+    if (modelConfig.supplier_id === supplier.id || !modelConfig.supplier_id) {
+      modelConfig.supplier_id = replacementId;
+    }
+  });
   getDebaterPresets().forEach((preset) => {
     if (preset.supplier_id === supplier.id || !preset.supplier_id) {
       preset.supplier_id = replacementId;
@@ -2195,6 +2376,16 @@ function getMessageRewindIconSvg() {
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M9 14 5 10l4-4" />
       <path d="M5 10h11a4 4 0 1 1 0 8h-1" />
+    </svg>
+  `;
+}
+
+function getMessageDetailIconSvg() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 4.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0 -17Z" />
+      <path d="M12 10.75v5" />
+      <path d="M12 7.75h.01" />
     </svg>
   `;
 }
@@ -2580,6 +2771,18 @@ function getActiveUserMessage(session) {
 
 function isDebaterSpeechMessage(message) {
   return ["pro", "con"].includes(String(message?.role || ""));
+}
+
+function hasMessageDetails(message) {
+  return Array.isArray(message?.details) && message.details.some((item) => item && typeof item === "object");
+}
+
+function findCurrentMessageById(messageId) {
+  const id = String(messageId || "");
+  if (!id) {
+    return null;
+  }
+  return (state.currentSession?.messages || []).find((message) => String(message.id || "") === id) || null;
 }
 
 function getMessageRewindMode(session, message) {
@@ -3663,6 +3866,7 @@ function renderMessageRow(message, session, options = {}) {
   const rewindMode = getMessageRewindMode(session, message);
   const rewindActionKey = buildMessageActionKey(session?.id || state.currentSessionId, message?.id, rewindMode);
   const rewinding = rewindMode && state.rewindingMessageActionKey === rewindActionKey;
+  const canShowDetails = ["pro", "con"].includes(String(message.role || "")) && hasMessageDetails(message);
   const actionHtml = retractable
     ? `
         <div class="message-foot">
@@ -3689,6 +3893,23 @@ function renderMessageRow(message, session, options = {}) {
         </button>
       `
     : "";
+  const detailButtonHtml = canShowDetails
+    ? `
+        <button
+          class="message-detail-button"
+          type="button"
+          data-action="open-message-details"
+          data-message-id="${escapeAttribute(message.id || "")}"
+          title="查看本步调用细节"
+          aria-label="查看本步调用细节"
+        >
+          ${getMessageDetailIconSvg()}
+        </button>
+      `
+    : "";
+  const sideActionsHtml = rewindButtonHtml || detailButtonHtml
+    ? `<div class="message-side-actions">${detailButtonHtml}${rewindButtonHtml}</div>`
+    : "";
   const headMetaHtml = roundLabel
     ? `
         <div class="message-head-meta">
@@ -3712,7 +3933,7 @@ function renderMessageRow(message, session, options = {}) {
           <div class="message-content">${formatTextBlock(renderedContent)}</div>
           ${actionHtml}
         </article>
-        ${rewindButtonHtml}
+        ${sideActionsHtml}
         ${timestampParts && !["user", "judge"].includes(message.role) ? `
           <span class="message-timestamp">
             ${timestampParts.major ? `<span class="message-timestamp-major">${escapeHtml(timestampParts.major)}</span>` : ""}
@@ -4071,6 +4292,492 @@ function downloadMarkdownPreview() {
     return;
   }
   triggerMarkdownDownload(state.markdownPreview.content, state.markdownPreview.fileName);
+}
+
+function getMessageDetailKindLabel(kind) {
+  const map = {
+    reasoning: "思考",
+    tool_call: "工具调用",
+    tool_result: "工具返回",
+    output: "正式输出",
+  };
+  return map[kind] || "步骤";
+}
+
+function getMessageDetailStepClass(step) {
+  const kind = String(step?.kind || "step");
+  const classes = ["message-detail-step-card", `detail-kind-${kind.replace(/[^a-z0-9_-]/gi, "-")}`];
+  if (step?.fallback) {
+    classes.push("detail-kind-fallback");
+  }
+  return classes.join(" ");
+}
+
+function getMessageDetailStepKindLabel(step) {
+  const kind = String(step?.kind || "step");
+  if (step?.fallback && kind === "tool_call") {
+    return "兜底搜索";
+  }
+  if (step?.fallback && kind === "tool_result") {
+    return "兜底返回";
+  }
+  return getMessageDetailKindLabel(kind);
+}
+
+function renderDetailValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return '<span class="message-detail-empty">未填写</span>';
+  }
+  if (typeof value === "object") {
+    return `<pre class="message-detail-code"><code>${escapeHtml(JSON.stringify(value, null, 2))}</code></pre>`;
+  }
+  return `<span class="message-detail-value">${escapeHtml(String(value))}</span>`;
+}
+
+function renderStructuredArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return renderDetailValue(args || {});
+  }
+  const entries = Object.entries(args);
+  if (!entries.length) {
+    return '<div class="message-detail-empty">没有参数。</div>';
+  }
+  return `
+    <div class="message-detail-kv">
+      ${entries
+        .map(
+          ([key, value]) => `
+            <div class="message-detail-kv-row">
+              <span class="message-detail-kv-key">${escapeHtml(key)}</span>
+              <div class="message-detail-kv-value">${renderDetailValue(value)}</div>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function getPreviewLines(text, maxLines = 10) {
+  const normalized = String(text || "").replace(/\r/g, "");
+  const lines = normalized.split("\n");
+  return {
+    preview: lines.slice(0, maxLines).join("\n").trim(),
+    omitted: Math.max(0, lines.length - maxLines),
+  };
+}
+
+function renderRenderedText(text, emptyText = "暂无内容。") {
+  const content = String(text || "").trim() || emptyText;
+  return `<div class="message-detail-rendered">${renderMarkdown(content)}</div>`;
+}
+
+function getDetailTargetKey(target) {
+  const kind = String(target?.contentKind || "");
+  const detailIndex = Number(target?.detailIndex ?? -1);
+  const entryIndex = target?.entryIndex === null || target?.entryIndex === undefined ? "" : Number(target.entryIndex);
+  return `${kind}:${detailIndex}:${entryIndex}`;
+}
+
+function getActiveDetailTextView(target) {
+  const key = getDetailTargetKey(target);
+  return state.messageDetail?.activeViews?.[key] || "original";
+}
+
+function getDetailViewCache(views, view) {
+  return views && typeof views === "object" && views[view] && typeof views[view] === "object" ? views[view] : null;
+}
+
+function renderDetailTextControls(target, activeView, views) {
+  const key = getDetailTargetKey(target);
+  const loadingView = state.messageDetailLoadingKey === `${key}:${activeView}` ? activeView : "";
+  const hasTranslation = Boolean(getDetailViewCache(views, "translation"));
+  const hasSummary = Boolean(getDetailViewCache(views, "summary"));
+  const button = (view, label, title, cached) => `
+    <button
+      class="detail-text-view-button ${activeView === view ? "active" : ""} ${cached ? "cached" : ""}"
+      type="button"
+      data-action="message-detail-text-view"
+      data-view="${escapeAttribute(view)}"
+      data-content-kind="${escapeAttribute(target.contentKind)}"
+      data-detail-index="${escapeAttribute(target.detailIndex)}"
+      ${target.entryIndex === null || target.entryIndex === undefined ? "" : `data-entry-index="${escapeAttribute(target.entryIndex)}"`}
+      title="${escapeAttribute(title)}"
+      aria-label="${escapeAttribute(title)}"
+      ${state.messageDetailLoadingKey ? "disabled" : ""}
+    >
+      ${loadingView === view ? '<span class="detail-text-spinner"></span>' : escapeHtml(label)}
+    </button>
+  `;
+  return `
+    <div class="detail-text-view-controls">
+      ${button("translation", "译", hasTranslation ? "查看缓存翻译" : "翻译", hasTranslation)}
+      ${button("summary", "摘", hasSummary ? "查看缓存总结" : "总结", hasSummary)}
+      ${button("original", "原", "显示原内容", true)}
+    </div>
+  `;
+}
+
+function renderTranslationView(view, originalText, emptyText) {
+  const sourceLanguage = String(view?.source_language || "未知").trim() || "未知";
+  const translated = String(view?.translated_content || "").trim();
+  const isChineseSource = ["简体中文", "中文", "汉语"].some((label) => sourceLanguage.includes(label));
+  const body = translated || (isChineseSource ? originalText : "翻译模型没有返回翻译内容。");
+  return `
+    <div class="message-detail-rendered detail-text-rendered-with-meta">
+      <div class="detail-text-language-tag">源语言：${escapeHtml(sourceLanguage)}</div>
+      ${renderMarkdown(String(body || "").trim() || emptyText || "暂无翻译内容。")}
+    </div>
+  `;
+}
+
+function renderSummaryView(view) {
+  return renderRenderedText(view?.summary_content || "", "暂无总结内容。");
+}
+
+function renderOriginalDetailText(text, emptyText, originalMaxLines) {
+  if (originalMaxLines) {
+    const { preview, omitted } = getPreviewLines(text, originalMaxLines);
+    return `
+      ${renderRenderedText(preview, emptyText)}
+      ${omitted ? `<div class="message-detail-more">已预览前 ${originalMaxLines} 行，另有 ${omitted} 行可在细版记录中查看。</div>` : ""}
+    `;
+  }
+  return renderRenderedText(text, emptyText);
+}
+
+function renderSwitchableDetailText({
+  text,
+  emptyText,
+  target,
+  views = {},
+  originalMaxLines = 0,
+}) {
+  const activeView = getActiveDetailTextView(target);
+  const key = getDetailTargetKey(target);
+  const loading = state.messageDetailLoadingKey === `${key}:${activeView}`;
+  const translation = getDetailViewCache(views, "translation");
+  const summary = getDetailViewCache(views, "summary");
+  let contentHtml = "";
+  if (loading) {
+    contentHtml = '<div class="message-detail-rendered detail-text-loading">正在生成，请稍候...</div>';
+  } else if (activeView === "translation" && translation) {
+    contentHtml = renderTranslationView(translation, text, emptyText);
+  } else if (activeView === "summary" && summary) {
+    contentHtml = renderSummaryView(summary);
+  } else {
+    contentHtml = renderOriginalDetailText(text, emptyText, originalMaxLines);
+  }
+  return `
+    <div class="detail-text-panel" data-detail-target="${escapeAttribute(key)}">
+      ${renderDetailTextControls(target, activeView, views)}
+      <div class="detail-text-content">${contentHtml}</div>
+    </div>
+  `;
+}
+
+function isReasoningMetricEntry(entry) {
+  const source = String(entry?.source || "").toLowerCase();
+  const content = String(entry?.content || "").trim();
+  if (!source) {
+    return false;
+  }
+  const leaf = source.split(/[.[\]]+/).filter(Boolean).pop() || "";
+  const looksLikeTokenMetric = leaf.endsWith("_tokens") || source.includes("token_usage") || source.includes("usage_metadata");
+  return looksLikeTokenMetric && /^-?\d+(\.\d+)?$/.test(content);
+}
+
+function renderReasoningEntries(entries) {
+  const normalized = Array.isArray(entries) ? entries : [];
+  const visibleEntries = normalized.filter((entry) => String(entry?.content || "").trim() && !isReasoningMetricEntry(entry));
+  if (!visibleEntries.length) {
+    return '<div class="message-detail-empty">本次调用没有返回可见思考内容。</div>';
+  }
+  return visibleEntries
+    .map((entry) => `
+        <div class="message-detail-reasoning">
+          ${renderSwitchableDetailText({
+            text: entry.content,
+            emptyText: "暂无思考内容。",
+            target: {
+              contentKind: "reasoning",
+              detailIndex: entry._detail_index,
+              entryIndex: entry._entry_index,
+            },
+            views: entry.views || {},
+          })}
+        </div>
+      `)
+    .join("");
+}
+
+function normalizeMessageDetailFrames(details) {
+  const frames = [];
+  let pendingReasoning = [];
+
+  for (const [detailIndex, step] of details.entries()) {
+    const kind = String(step?.kind || "");
+    if (kind === "reasoning") {
+      const entries = Array.isArray(step.entries) ? step.entries : [];
+      pendingReasoning = pendingReasoning.concat(
+        entries.map((entry, entryIndex) => ({
+          ...(entry && typeof entry === "object" ? entry : { content: String(entry || "") }),
+          _detail_index: detailIndex,
+          _entry_index: entryIndex,
+        })),
+      );
+      continue;
+    }
+    frames.push({
+      ...step,
+      _detail_index: detailIndex,
+      reasoning_entries: pendingReasoning,
+    });
+    pendingReasoning = [];
+  }
+
+  if (pendingReasoning.length) {
+    frames.push({
+      kind: "reasoning",
+      title: "模型思考",
+      entries: pendingReasoning,
+    });
+  }
+
+  return frames;
+}
+
+function renderAttachedReasoning(step) {
+  const entries = Array.isArray(step?.reasoning_entries) ? step.reasoning_entries : [];
+  const visibleEntries = entries.filter((entry) => String(entry?.content || "").trim() && !isReasoningMetricEntry(entry));
+  if (!visibleEntries.length) {
+    return "";
+  }
+  return `
+    <div class="message-detail-attached-reasoning">
+      <div class="message-detail-section-label">思考内容</div>
+      ${renderReasoningEntries(visibleEntries)}
+    </div>
+  `;
+}
+
+function renderMessageDetailStep(step, index) {
+  const kind = String(step?.kind || "step");
+  const title = String(step?.title || `${getMessageDetailKindLabel(kind)} ${index + 1}`);
+  let body = "";
+
+  if (kind === "reasoning") {
+    body = renderReasoningEntries(step.entries);
+  } else if (kind === "tool_call") {
+    body = `
+      ${renderAttachedReasoning(step)}
+      <div class="message-detail-tool-name">${escapeHtml(step.tool_name || "web_search")}</div>
+      ${step.fallback ? '<div class="message-detail-fallback-note">模型未主动调用工具或工具协议失败，本轮由后端自动执行兜底搜索。</div>' : ""}
+      ${renderStructuredArgs(step.args)}
+    `;
+  } else if (kind === "tool_result") {
+    body = `
+      <div class="message-detail-tool-name">${escapeHtml(step.tool_name || "web_search")}</div>
+      ${step.fallback ? '<div class="message-detail-fallback-note">这是后端兜底搜索返回结果。</div>' : ""}
+      ${renderSwitchableDetailText({
+        text: step.result,
+        emptyText: "工具没有返回可展示内容。",
+        target: {
+          contentKind: "tool_result",
+          detailIndex: step._detail_index,
+          entryIndex: null,
+        },
+        views: step.views || {},
+        originalMaxLines: 12,
+      })}
+    `;
+  } else if (kind === "output") {
+    body = `
+      ${renderAttachedReasoning(step)}
+      <div class="message-detail-section-label">正式输出</div>
+      ${renderRenderedText(step.content, "本步骤没有正式输出。")}
+    `;
+  } else {
+    body = renderStructuredArgs(step);
+  }
+
+  return `
+    <section class="${getMessageDetailStepClass(step)}">
+      <div class="message-detail-step-head">
+        <span class="message-detail-step-index">框 ${index + 1}</span>
+        <span class="message-detail-step-kind">${escapeHtml(getMessageDetailStepKindLabel(step))}</span>
+        <h4>${escapeHtml(title)}</h4>
+      </div>
+      <div class="message-detail-step-body">${body}</div>
+    </section>
+  `;
+}
+
+function renderMessageDetails(message, session) {
+  const details = Array.isArray(message?.details) ? message.details.filter((item) => item && typeof item === "object") : [];
+  if (!details.length) {
+    return '<div class="empty-state">这条消息没有保存到可展示的调用细节。</div>';
+  }
+  const frames = normalizeMessageDetailFrames(details);
+  const label = getRoleDisplayLabel(message, session);
+  const roundLabel = message.round ? `第 ${message.round} 轮` : "";
+  const meta = [label, roundLabel].filter(Boolean).join(" · ");
+  return `
+    <div class="message-detail-meta">${escapeHtml(meta || "模型消息")}</div>
+    <div class="message-detail-steps">
+      ${frames.map((step, index) => renderMessageDetailStep(step, index)).join("")}
+    </div>
+  `;
+}
+
+function parseDetailTextViewTarget(action) {
+  const entryRaw = action.dataset.entryIndex;
+  return {
+    view: String(action.dataset.view || "original"),
+    contentKind: String(action.dataset.contentKind || ""),
+    detailIndex: Number(action.dataset.detailIndex),
+    entryIndex: entryRaw === undefined || entryRaw === "" ? null : Number(entryRaw),
+  };
+}
+
+function findDetailContainerForTarget(message, target) {
+  const details = Array.isArray(message?.details) ? message.details : [];
+  const detail = details[target.detailIndex];
+  if (!detail || typeof detail !== "object") {
+    return null;
+  }
+  if (target.contentKind === "reasoning") {
+    const entries = Array.isArray(detail.entries) ? detail.entries : [];
+    const entry = entries[target.entryIndex];
+    return entry && typeof entry === "object" ? entry : null;
+  }
+  if (target.contentKind === "tool_result") {
+    return detail;
+  }
+  return null;
+}
+
+function getCachedDetailTextView(target) {
+  const message = findCurrentMessageById(state.messageDetail?.messageId || "");
+  const container = findDetailContainerForTarget(message, target);
+  const views = container?.views && typeof container.views === "object" ? container.views : {};
+  const cached = views[target.view];
+  return cached && typeof cached === "object" ? cached : null;
+}
+
+function setActiveDetailTextView(target, view) {
+  if (!state.messageDetail) {
+    return;
+  }
+  state.messageDetail.activeViews = state.messageDetail.activeViews || {};
+  state.messageDetail.activeViews[getDetailTargetKey(target)] = view;
+}
+
+function rerenderMessageDetailBody({ preserveScroll = true } = {}) {
+  if (!state.messageDetail?.messageId) {
+    return;
+  }
+  const message = findCurrentMessageById(state.messageDetail.messageId);
+  if (!message) {
+    return;
+  }
+  const scrollTop = preserveScroll ? els.messageDetailBody.scrollTop : 0;
+  els.messageDetailBody.innerHTML = renderMessageDetails(message, state.currentSession);
+  els.messageDetailBody.scrollTop = scrollTop;
+}
+
+async function handleMessageDetailBodyClick(event) {
+  const action = event.target.closest("[data-action='message-detail-text-view']");
+  if (!action || !state.messageDetail?.messageId || !state.currentSession?.id) {
+    return;
+  }
+  const target = parseDetailTextViewTarget(action);
+  if (!Number.isInteger(target.detailIndex) || (target.contentKind === "reasoning" && !Number.isInteger(target.entryIndex))) {
+    showLocalError("无法定位这段调用细节文本。", true);
+    return;
+  }
+
+  if (target.view === "original") {
+    setActiveDetailTextView(target, "original");
+    rerenderMessageDetailBody();
+    return;
+  }
+
+  if (getCachedDetailTextView(target)) {
+    setActiveDetailTextView(target, target.view);
+    rerenderMessageDetailBody();
+    return;
+  }
+
+  const loadingKey = `${getDetailTargetKey(target)}:${target.view}`;
+  if (state.messageDetailLoadingKey) {
+    return;
+  }
+  state.messageDetailLoadingKey = loadingKey;
+  setActiveDetailTextView(target, target.view);
+  rerenderMessageDetailBody();
+
+  try {
+    const result = await api(`/api/debates/${state.currentSession.id}/message-detail-view`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message_id: state.messageDetail.messageId,
+        detail_index: target.detailIndex,
+        content_kind: target.contentKind,
+        entry_index: target.entryIndex,
+        view: target.view,
+      }),
+    });
+    if (result?.session) {
+      state.currentSession = result.session;
+      upsertSessionSummary(result.session);
+      renderSessions();
+    }
+  } catch (error) {
+    setActiveDetailTextView(target, "original");
+    showLocalError(error?.message || "生成内容失败，请检查翻译/总结模型配置。", true);
+  } finally {
+    state.messageDetailLoadingKey = "";
+    rerenderMessageDetailBody();
+  }
+}
+
+function openMessageDetails(messageId) {
+  const message = findCurrentMessageById(messageId);
+  if (!message || !["pro", "con"].includes(String(message.role || "")) || !hasMessageDetails(message)) {
+    showLocalError("这条消息还没有可查看的调用细节。", true);
+    return;
+  }
+  state.messageDetail = {
+    messageId: message.id,
+    sessionId: state.currentSession?.id || "",
+    activeViews: {},
+  };
+  window.clearTimeout(state.messageDetailModalTimer);
+  els.messageDetailModal.classList.remove("hidden", "modal-leaving");
+  els.messageDetailModal.classList.add("modal-visible");
+  els.messageDetailEyebrow.textContent = "Call Details";
+  els.messageDetailTitle.textContent = "模型调用细节";
+  els.messageDetailBody.innerHTML = renderMessageDetails(message, state.currentSession);
+  els.messageDetailBody.scrollTop = 0;
+}
+
+function closeMessageDetailModal({ immediate = false } = {}) {
+  window.clearTimeout(state.messageDetailModalTimer);
+  state.messageDetailLoadingKey = "";
+  state.messageDetail = null;
+  if (immediate) {
+    els.messageDetailModal.classList.add("hidden");
+    els.messageDetailModal.classList.remove("modal-visible", "modal-leaving");
+    return;
+  }
+  els.messageDetailModal.classList.remove("modal-visible");
+  els.messageDetailModal.classList.add("modal-leaving");
+  state.messageDetailModalTimer = window.setTimeout(() => {
+    els.messageDetailModal.classList.add("hidden");
+    els.messageDetailModal.classList.remove("modal-leaving");
+  }, MODAL_MOTION_MS);
 }
 
 async function downloadSessionExport(kind) {

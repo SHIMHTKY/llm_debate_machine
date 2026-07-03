@@ -6,10 +6,22 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..logger import DebateLogger
-from .common import clean_tool_artifacts, coerce_int, extract_usage, parse_json_response, response_to_text
+from .common import (
+    clean_tool_artifacts,
+    coerce_int,
+    extract_reasoning_details,
+    extract_usage,
+    parse_json_response,
+    response_to_text,
+)
+
+DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS = 2500
+MIN_TOOL_OUTPUT_TRUNCATE_CHARS = 500
+MAX_TOOL_OUTPUT_TRUNCATE_CHARS = 20000
 
 
 async def ainvoke_with_metrics(
@@ -25,6 +37,9 @@ async def ainvoke_with_metrics(
 
     # 先真正请求模型。
     response = await runnable.ainvoke(messages)
+    reasoning_entries = extract_reasoning_details(response)
+    if reasoning_entries:
+        logger.log_llm_reasoning(role_key, stage_label, reasoning_entries)
     if logger.metrics_enabled:
         # 从响应里抽 usage；如果 SDK 没给，就退回估算。
         usage, estimated, _ = extract_usage(response, estimate_llm or runnable, messages)
@@ -42,6 +57,51 @@ def compose_user_message(user_message: str, tool_results: list[str]) -> str:
     return f"{user_message}\n\n【本轮检索结果】\n{joined}"
 
 
+def build_emergency_final_text(user_message: str) -> str:
+    """模型连续返回空正文时的最后兜底发言。"""
+
+    topic_hint = build_fallback_search_query(user_message)[:48]
+    return (
+        f"基于现有资料，关于“{topic_hint}”，我方认为不能只看单一结论，"
+        "而应同时比较事实依据、现实影响和制度后果。对方若忽略这些层面的权衡，"
+        "就容易把复杂问题简化为立场判断；因此我方仍坚持当前论证方向。"
+    )
+
+
+def build_fallback_search_query(user_message: str) -> str:
+    """从辩手输入里兜底提取一个简短搜索词。
+
+    当模型没有按 react / bind_tools 协议触发工具时，后端仍然需要一个稳定查询。
+    这里不追求完美语义，只追求“短、可搜索、不会把整段历史塞进搜索引擎”。
+    """
+
+    text = re.sub(r"\s+", " ", str(user_message or "")).strip()
+    text = re.sub(r"【[^】]{1,40}】", " ", text)
+    text = re.sub(r"(最近辩论记录|请继续发言|请开始你的开篇立论|请给出你的开篇立论|本轮检索结果)", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ，。；：、,.!?！？:：-—")
+    if not text:
+        return "辩论事实 背景 案例"
+    # 优先取后半段，因为通常最新一轮对方观点在 user_message 后部。
+    text = text[-160:]
+    return text[:100].strip(" ，。；：、,.!?！？:：-—") or "辩论事实 背景 案例"
+
+
+def normalize_tool_args(args: Any, fallback_query: str) -> dict[str, Any]:
+    """把不同模型给出的工具参数统一成 web_search 可接受的 dict。"""
+
+    if isinstance(args, dict):
+        normalized = dict(args)
+    elif isinstance(args, str):
+        parsed = parse_json_response(args)
+        normalized = parsed if parsed else {"query": args}
+    else:
+        normalized = {}
+
+    query = normalized.get("query") or normalized.get("q") or normalized.get("search_query") or normalized.get("keywords")
+    normalized["query"] = str(query or fallback_query).strip() or fallback_query
+    return normalized
+
+
 def extract_tool_action(text: str) -> dict[str, Any] | None:
     """从 react 模式响应中提取工具调用指令。"""
 
@@ -52,9 +112,16 @@ def extract_tool_action(text: str) -> dict[str, Any] | None:
     # 兼容两种协议：
     # 1. {action, action_input}
     # 2. {tool_calls: [{name, args}]}
-    action_name = payload.get("action")
-    action_input = payload.get("action_input")
-    if action_name == "web_search":
+    action_name = payload.get("action") or payload.get("tool") or payload.get("name")
+    action_input = (
+        payload.get("action_input")
+        or payload.get("args")
+        or payload.get("arguments")
+        or payload.get("input")
+        or payload.get("query")
+        or payload.get("search_query")
+    )
+    if action_name in {"web_search", "search", "tavily_search"}:
         return {
             "name": "web_search",
             "args": action_input if isinstance(action_input, dict) else {"query": action_input},
@@ -63,10 +130,29 @@ def extract_tool_action(text: str) -> dict[str, Any] | None:
     tool_calls = payload.get("tool_calls")
     if isinstance(tool_calls, list) and tool_calls:
         tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
-        if tool_call.get("name") == "web_search":
-            return {"name": "web_search", "args": tool_call.get("args", {})}
+        tool_name = tool_call.get("name") or tool_call.get("tool") or tool_call.get("action")
+        if tool_name in {"web_search", "search", "tavily_search"}:
+            return {"name": "web_search", "args": tool_call.get("args") or tool_call.get("arguments") or {}}
 
     return None
+
+
+def find_tool(tools: list[Any], tool_name: str) -> Any | None:
+    """按名称查找工具，找不到时退回第一个工具。"""
+
+    normalized = str(tool_name or "web_search").strip()
+    for tool in tools:
+        if getattr(tool, "name", "") == normalized:
+            return tool
+    return tools[0] if tools else None
+
+
+def format_tool_result(tool_name: str, args: dict[str, Any], result: str) -> str:
+    query = str(args.get("query") or "").strip()
+    prefix = f"工具 `{tool_name}`"
+    if query:
+        prefix += f" 查询：{query}"
+    return f"{prefix}\n{result}"
 
 
 async def invoke_tool(tool: Any, args: dict[str, Any]) -> str:
@@ -78,8 +164,59 @@ async def invoke_tool(tool: Any, args: dict[str, Any]) -> str:
         result = tool.invoke(args)
 
     text = str(result)
+    metadata = getattr(tool, "metadata", None)
+    configured_limit = metadata.get("output_truncate_chars") if isinstance(metadata, dict) else None
+    truncate_chars = coerce_int(configured_limit) or DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS
+    truncate_chars = max(MIN_TOOL_OUTPUT_TRUNCATE_CHARS, min(truncate_chars, MAX_TOOL_OUTPUT_TRUNCATE_CHARS))
     # 工具原始返回过长会严重膨胀 prompt，所以这里硬裁长度。
-    return text[:2500] + ("\n...[输出已截断]" if len(text) > 2500 else "")
+    return text[:truncate_chars] + ("\n...[输出已截断]" if len(text) > truncate_chars else "")
+
+
+async def execute_tool_action(
+    tools: list[Any],
+    action: dict[str, Any],
+    fallback_query: str,
+    logger: DebateLogger,
+    role_key: str,
+    agent_name: str,
+    *,
+    fallback: bool = False,
+) -> str:
+    """执行模型给出的工具动作；失败时返回可喂给模型的文本结果。"""
+
+    tool = find_tool(tools, str(action.get("name") or "web_search"))
+    if tool is None:
+        return ""
+    tool_name = getattr(tool, "name", "web_search")
+    tool_args = normalize_tool_args(action.get("args"), fallback_query)
+    try:
+        result = await invoke_tool(tool, tool_args)
+    except Exception as exc:
+        # 工具失败不应该让整轮辩论直接中断，所以这里转成文本反馈给模型。
+        result = f"工具执行失败：{exc}"
+    logger.log_tool_call(role_key, agent_name, tool_name, tool_args, result, fallback=fallback)
+    return format_tool_result(tool_name, tool_args, result)
+
+
+async def execute_fallback_search(
+    tools: list[Any],
+    user_message: str,
+    logger: DebateLogger,
+    role_key: str,
+    agent_name: str,
+) -> str:
+    """模型没有稳定触发工具时，由后端托管执行一次搜索。"""
+
+    query = build_fallback_search_query(user_message)
+    return await execute_tool_action(
+        tools,
+        {"name": "web_search", "args": {"query": query}},
+        query,
+        logger,
+        role_key,
+        agent_name,
+        fallback=True,
+    )
 
 
 async def run_plain_mode(
@@ -104,7 +241,34 @@ async def run_plain_mode(
         stage_label,
         estimate_llm=llm,
     )
-    return clean_tool_artifacts(response_to_text(response))
+    text = clean_tool_artifacts(response_to_text(response))
+    if text.strip():
+        return text
+
+    # 一些 reasoning / thinking 模型在预算不足或网关兼容性不佳时会返回空 content。
+    # 这里只重试一次，并明确要求直接给最终可见正文，避免辩论流出现空消息。
+    retry_response = await ainvoke_with_metrics(
+        llm,
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{user_message}\n\n"
+                    "上一轮没有返回可见正文。请不要调用工具，不要输出思考过程，"
+                    "直接给出一段 80 到 180 字的中文最终发言。"
+                ),
+            },
+        ],
+        logger,
+        role_key,
+        f"{stage_label}（空回复重试）",
+        estimate_llm=llm,
+    )
+    retry_text = clean_tool_artifacts(response_to_text(retry_response))
+    if retry_text.strip():
+        return retry_text
+    return build_emergency_final_text(user_message)
 
 
 async def run_bind_tools_mode(
@@ -117,46 +281,82 @@ async def run_bind_tools_mode(
     agent_name: str,
     stage_label: str,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool = False,
 ) -> str:
     """使用 LangChain bind_tools 模式执行。"""
 
     # bind_tools 的核心思想是：让模型直接决定何时触发工具调用。
-    llm_with_tools = llm.bind_tools(tools)
     tool_results: list[str] = []
-    max_tool_rounds = coerce_int(max_tool_rounds) or 2
+    max_tool_rounds = max(1, coerce_int(max_tool_rounds) or 2)
 
-    for _ in range(max_tool_rounds):
-        response = await ainvoke_with_metrics(
-            llm_with_tools,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": compose_user_message(user_message, tool_results)},
-            ],
+    bind_system_prompt = (
+        f"{system_prompt}\n\n"
+        "工具调用协议：本轮已经启用 `web_search`。如果你需要事实、数据、案例或背景信息，"
+        "请优先通过 tool_calls 调用 `web_search`，不要把工具调用格式写进正文。"
+    )
+
+    try:
+        llm_with_tools = llm.bind_tools(tools)
+    except Exception:
+        if tool_fallback_enabled:
+            fallback_result = await execute_fallback_search(tools, user_message, logger, role_key, agent_name)
+            if fallback_result:
+                tool_results.append(fallback_result)
+        return await run_plain_mode(
+            llm,
+            system_prompt,
+            compose_user_message(user_message, tool_results),
             logger,
             role_key,
             stage_label,
-            estimate_llm=llm,
         )
+
+    for round_index in range(max_tool_rounds):
+        try:
+            response = await ainvoke_with_metrics(
+                llm_with_tools,
+                [
+                    {"role": "system", "content": bind_system_prompt},
+                    {"role": "user", "content": compose_user_message(user_message, tool_results)},
+                ],
+                logger,
+                role_key,
+                stage_label,
+                estimate_llm=llm,
+            )
+        except Exception:
+            # 某些模型/网关会接受普通聊天但不接受 tools 参数。
+            # 这时不让整轮失败，而是退回“后端托管一次搜索 + 普通发言”。
+            if tool_fallback_enabled and not tool_results:
+                fallback_result = await execute_fallback_search(tools, user_message, logger, role_key, agent_name)
+                if fallback_result:
+                    tool_results.append(fallback_result)
+            break
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
-            # 没有工具调用时，说明模型已经给出了最终答案。
+            if tool_fallback_enabled and not tool_results and round_index == 0:
+                # bind_tools API 可用但模型没有主动发起工具调用时，兜底搜索一次。
+                fallback_result = await execute_fallback_search(tools, user_message, logger, role_key, agent_name)
+                if fallback_result:
+                    tool_results.append(fallback_result)
+                    break
+            # 没有工具调用且已经有工具结果时，说明模型给出了最终答案。
             return clean_tool_artifacts(response_to_text(response))
 
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
-            tool_args = tool_call.get("args", {}) or {}
-            for tool in tools:
-                if tool.name != tool_name:
-                    continue
-                try:
-                    result = await invoke_tool(tool, tool_args)
-                except Exception as exc:
-                    # 工具失败不应该让整轮辩论直接中断，所以这里转成文本反馈给模型。
-                    result = f"工具执行失败：{exc}"
-                logger.log_tool_call(role_key, agent_name, tool_name, tool_args, result)
+            fallback_query = build_fallback_search_query(user_message)
+            result = await execute_tool_action(
+                tools,
+                {"name": tool_name, "args": tool_call.get("args", {}) or {}},
+                fallback_query,
+                logger,
+                role_key,
+                agent_name,
+            )
+            if result:
                 tool_results.append(result)
-                break
 
     # 达到最大工具轮数后，强制进入纯回答模式，避免 agent 无限找资料不产出答案。
     return await run_plain_mode(
@@ -179,56 +379,76 @@ async def run_react_mode(
     agent_name: str,
     stage_label: str,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool = False,
 ) -> str:
     """使用“模型先输出 JSON 工具指令”的 react 风格执行。"""
 
     if not tools:
         return await run_plain_mode(llm, system_prompt, user_message, logger, role_key, stage_label)
 
-    # react 模式下，我们把工具协议写死到 prompt 里，让模型先返回指令，再由后端执行。
+    # react 模式下，必须把“工具规划”和“最终发言”拆开。
+    # 原始 system_prompt 里通常会有“不要输出 JSON / 只返回正文”之类规则，
+    # 如果直接复用它做工具规划，会和 ReAct JSON 协议互相打架。
     tool_descriptions = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
-    react_prompt = (
-        f"{system_prompt}\n\n"
-        "如果需要使用工具，请严格返回 JSON，不要输出别的内容：\n"
-        "{\n"
-        '  "action": "web_search",\n'
-        '  "action_input": {"query": "简短搜索词"}\n'
-        "}\n\n"
-        "可用工具：\n"
-        f"{tool_descriptions}\n\n"
-        "如果不需要工具，直接返回最终发言。"
-    )
-
     tool_results: list[str] = []
-    max_tool_rounds = coerce_int(max_tool_rounds) or 2
-    for _ in range(max_tool_rounds):
-        response = await ainvoke_with_metrics(
-            llm,
-            [
-                {"role": "system", "content": react_prompt},
-                {"role": "user", "content": compose_user_message(user_message, tool_results)},
-            ],
-            logger,
-            role_key,
-            stage_label,
-            estimate_llm=llm,
+    max_tool_rounds = max(1, coerce_int(max_tool_rounds) or 2)
+    fallback_query = build_fallback_search_query(user_message)
+
+    for round_index in range(max_tool_rounds):
+        must_call_tool = tool_fallback_enabled and round_index == 0 and not tool_results
+        react_prompt = (
+            "你是辩论系统的工具规划器，不是最终发言者。\n"
+            "你的唯一任务是判断是否需要调用工具，并输出机器可解析 JSON。\n"
+            "不要输出解释、Markdown、代码块、最终辩论发言或思考过程。\n\n"
+            "可用工具：\n"
+            f"{tool_descriptions}\n\n"
+            "输出协议二选一：\n"
+            "1. 调用工具：\n"
+            '{"action":"web_search","action_input":{"query":"简短搜索词"}}\n'
+            "2. 不再调用工具：\n"
+            '{"action":"final"}\n\n'
+            f"本轮默认搜索词：{fallback_query}\n"
         )
-        response_text = clean_tool_artifacts(response_to_text(response))
+        if must_call_tool:
+            react_prompt += "本轮必须先调用一次 web_search。请只返回第 1 种 JSON。\n"
+        else:
+            react_prompt += "如果已有资料足够，请只返回第 2 种 JSON。\n"
+
+        try:
+            response = await ainvoke_with_metrics(
+                llm,
+                [
+                    {"role": "system", "content": react_prompt},
+                    {"role": "user", "content": compose_user_message(user_message, tool_results)},
+                ],
+                logger,
+                role_key,
+                stage_label,
+                estimate_llm=llm,
+            )
+            response_text = clean_tool_artifacts(response_to_text(response))
+        except Exception:
+            if tool_fallback_enabled and not tool_results:
+                fallback_result = await execute_fallback_search(tools, user_message, logger, role_key, agent_name)
+                if fallback_result:
+                    tool_results.append(fallback_result)
+            break
+
         action = extract_tool_action(response_text)
         if not action:
-            # 一旦模型不再输出工具指令，就把当前文本视为最终发言。
-            return response_text
-
-        for tool in tools:
-            if tool.name != action["name"]:
-                continue
-            try:
-                result = await invoke_tool(tool, action["args"])
-            except Exception as exc:
-                result = f"工具执行失败：{exc}"
-            logger.log_tool_call(role_key, agent_name, action["name"], action["args"], result)
-            tool_results.append(result)
+            payload = parse_json_response(response_text)
+            if payload.get("action") == "final" and tool_results:
+                break
+            if tool_fallback_enabled and not tool_results:
+                # 模型没有遵守 JSON 协议时，后端兜底执行一次搜索，确保 react 模式可用。
+                fallback_result = await execute_fallback_search(tools, user_message, logger, role_key, agent_name)
+                if fallback_result:
+                    tool_results.append(fallback_result)
             break
+
+        result = await execute_tool_action(tools, action, fallback_query, logger, role_key, agent_name)
+        if result:
+            tool_results.append(result)
 
     # 超出允许轮数后，不再继续问工具，而是要求模型基于已有资料给终稿。
     final_message = compose_user_message(
@@ -249,6 +469,7 @@ async def run_agent(
     tool_mode: str,
     stage_label: str,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool = False,
 ) -> str:
     """统一的辩手代理入口。"""
 
@@ -266,6 +487,7 @@ async def run_agent(
             agent_name,
             stage_label,
             max_tool_rounds,
+            tool_fallback_enabled,
         )
     # 默认走 bind_tools，因为它和 LangChain 的标准工具链整合更自然。
     return await run_bind_tools_mode(
@@ -278,4 +500,5 @@ async def run_agent(
         agent_name,
         stage_label,
         max_tool_rounds,
+        tool_fallback_enabled,
     )

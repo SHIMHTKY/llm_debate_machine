@@ -58,6 +58,126 @@ def response_to_text(response: Any) -> str:
     return str(content or "")
 
 
+REASONING_KEY_PARTS = ("reasoning", "thinking", "thought")
+REASONING_TAGS = ("think", "thinking", "reasoning")
+REASONING_SKIP_KEY_PARTS = ("token", "usage")
+REASONING_SKIP_EXACT_KEYS = {"reasoning_tokens", "cached_tokens", "total_tokens", "prompt_tokens", "completion_tokens"}
+
+
+def _is_reasoning_metric_path(source: str) -> bool:
+    """过滤 reasoning_tokens 这类 usage 指标，避免把数字当作思考内容展示。"""
+
+    normalized = str(source or "").lower()
+    leaf = re.split(r"[.\[\]]+", normalized)[-1]
+    if leaf in REASONING_SKIP_EXACT_KEYS or leaf.endswith("_tokens"):
+        return True
+    return any(part in normalized for part in ("token_usage", "usage_metadata", "completion_tokens_details", "prompt_tokens_details"))
+
+
+def _reasoning_value_to_text(value: Any) -> str:
+    """把供应商返回的思考字段转成适合写入 Markdown 的文本。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if hasattr(value, "model_dump"):
+        try:
+            value = value.model_dump()
+        except Exception:
+            pass
+    elif hasattr(value, "dict"):
+        try:
+            value = value.dict()
+        except Exception:
+            pass
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2, default=str).strip()
+        except TypeError:
+            return str(value).strip()
+    return str(value).strip()
+
+
+def extract_reasoning_details(response: Any) -> list[dict[str, str]]:
+    """提取模型响应中供应商实际返回的思考信息。
+
+    注意：这里不能读取供应商没有返回的隐藏推理，只记录响应对象里已经暴露的
+    reasoning / thinking / thought 字段，以及正文中显式出现的 <think> 块。
+    """
+
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_entry(source: str, value: Any) -> None:
+        if _is_reasoning_metric_path(source):
+            return
+        text = _reasoning_value_to_text(value)
+        if not text:
+            return
+        key = f"{source}\n{text}"
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append({"source": source, "content": text})
+
+    def collect_from_mapping(value: Any, source: str) -> None:
+        if isinstance(value, dict):
+            for raw_key, item in value.items():
+                key = str(raw_key)
+                key_lower = key.lower()
+                nested_source = f"{source}.{key}"
+                if key_lower in REASONING_SKIP_EXACT_KEYS or any(part in key_lower for part in REASONING_SKIP_KEY_PARTS):
+                    continue
+                if any(part in key_lower for part in REASONING_KEY_PARTS):
+                    add_entry(nested_source, item)
+                elif isinstance(item, (dict, list, tuple)):
+                    collect_from_mapping(item, nested_source)
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                nested_source = f"{source}[{index}]"
+                if isinstance(item, dict):
+                    item_type = str(item.get("type") or "").lower()
+                    if any(part in item_type for part in REASONING_KEY_PARTS):
+                        add_entry(nested_source, item)
+                    collect_from_mapping(item, nested_source)
+                elif isinstance(item, (list, tuple)):
+                    collect_from_mapping(item, nested_source)
+
+    for attr_name in (
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "reasoning_summary",
+        "thinking",
+        "thinking_content",
+        "thought",
+        "thoughts",
+    ):
+        if hasattr(response, attr_name):
+            add_entry(f"response.{attr_name}", getattr(response, attr_name))
+
+    additional_kwargs = getattr(response, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        collect_from_mapping(additional_kwargs, "additional_kwargs")
+
+    response_metadata = getattr(response, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        collect_from_mapping(response_metadata, "response_metadata")
+
+    content = getattr(response, "content", None)
+    if isinstance(content, (list, tuple)):
+        collect_from_mapping(content, "content")
+
+    visible_text = response_to_text(response)
+    for tag in REASONING_TAGS:
+        pattern = rf"<{tag}\b[^>]*>(.*?)</{tag}>"
+        for index, match in enumerate(re.finditer(pattern, visible_text, flags=re.IGNORECASE | re.DOTALL), start=1):
+            add_entry(f"content.<{tag}>[{index}]", match.group(1))
+
+    return entries
+
+
 def normalize_debate_title(value: Any, fallback_topic: str) -> str:
     """把裁判生成的标题收敛到稳定、适合前端展示的形式。"""
 

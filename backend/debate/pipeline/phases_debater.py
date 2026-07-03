@@ -35,6 +35,7 @@ async def pro_first_speech(
     pro_tools: list[Any],
     tool_mode: str,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool,
 ) -> dict[str, Any]:
     """正方开篇立论。"""
 
@@ -63,6 +64,7 @@ async def pro_first_speech(
         tool_mode,
         "开篇立论",
         max_tool_rounds,
+        tool_fallback_enabled,
     )
     speech_text, _ = normalize_debater_response(response_text, allow_concede=False)
 
@@ -82,6 +84,7 @@ async def con_first_speech(
     con_tools: list[Any],
     tool_mode: str,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool,
 ) -> dict[str, Any]:
     """反方开篇立论。"""
 
@@ -106,6 +109,7 @@ async def con_first_speech(
         tool_mode,
         "开篇立论",
         max_tool_rounds,
+        tool_fallback_enabled,
     )
     speech_text, _ = normalize_debater_response(response_text, allow_concede=False)
 
@@ -125,6 +129,7 @@ async def pro_speech(
     tool_mode: str,
     history_window_size: int,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool,
 ) -> dict[str, Any]:
     """正方常规轮次发言。"""
 
@@ -153,6 +158,7 @@ async def pro_speech(
         tool_mode,
         f"第 {round_num} 轮发言",
         max_tool_rounds,
+        tool_fallback_enabled,
     )
     speech_text, conceded = normalize_debater_response(response_text, allow_concede=can_concede)
 
@@ -177,6 +183,7 @@ async def con_speech(
     tool_mode: str,
     history_window_size: int,
     max_tool_rounds: int,
+    tool_fallback_enabled: bool,
 ) -> dict[str, Any]:
     """反方常规轮次发言。"""
 
@@ -204,6 +211,7 @@ async def con_speech(
         tool_mode,
         f"第 {round_num} 轮发言",
         max_tool_rounds,
+        tool_fallback_enabled,
     )
     speech_text, conceded = normalize_debater_response(response_text, allow_concede=can_concede)
 

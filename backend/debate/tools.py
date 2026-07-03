@@ -9,6 +9,9 @@ from langchain_core.tools import tool
 
 DEFAULT_SEARCH_DEPTH = "advanced"
 DEFAULT_TIMEOUT = 60
+DEFAULT_OUTPUT_TRUNCATE_CHARS = 2500
+MIN_OUTPUT_TRUNCATE_CHARS = 500
+MAX_OUTPUT_TRUNCATE_CHARS = 20000
 
 
 def _clean_text(value: Any) -> str:
@@ -37,6 +40,14 @@ def _run_callable_with_timeout(func, timeout: int) -> dict[str, Any]:
     if "error" in error_box:
         return {"success": False, "error": f"搜索工具异常：{error_box['error']}"}
     return {"success": True, "data": result_box.get("value")}
+
+
+def _normalize_output_truncate_chars(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_OUTPUT_TRUNCATE_CHARS
+    return max(MIN_OUTPUT_TRUNCATE_CHARS, min(parsed, MAX_OUTPUT_TRUNCATE_CHARS))
 
 
 def _normalize_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -125,6 +136,8 @@ def create_search_tools(search_settings: dict[str, Any]) -> list[Any]:
     if not search_settings.get("enabled"):
         return []
 
+    output_truncate_chars = _normalize_output_truncate_chars(search_settings.get("output_truncate_chars"))
+
     @tool
     def web_search(query: str) -> str:
         """搜索网页资料，用于补充辩论事实、数据与案例。"""
@@ -166,5 +179,9 @@ def create_search_tools(search_settings: dict[str, Any]) -> list[Any]:
 
         return "\n".join(blocks).strip()
 
+    web_search.metadata = {
+        **(web_search.metadata or {}),
+        "output_truncate_chars": output_truncate_chars,
+    }
     return [web_search]
 

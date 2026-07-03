@@ -29,3 +29,11 @@ class DebateRewindRequest(BaseModel):
 
 class DebateTitleUpdateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=80)
+
+
+class MessageDetailViewRequest(BaseModel):
+    message_id: str = Field(min_length=1, max_length=128)
+    detail_index: int = Field(ge=0)
+    content_kind: Literal["reasoning", "tool_result"]
+    view: Literal["translation", "summary"]
+    entry_index: int | None = Field(default=None, ge=0)

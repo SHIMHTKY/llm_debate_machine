@@ -65,6 +65,8 @@ class BaseDebateLogger:
         self.metrics_enabled = bool(metrics_enabled)
         # _usage_stats 的具体结构由 UsageLoggerMixin 提供。
         self._usage_stats = self._create_usage_stats()
+        # 暂存一次可见消息产生前的模型调用链，消息落盘时会写入 message.details。
+        self._pending_model_details: dict[str, list[dict[str, Any]]] = {role: [] for role in TRACKED_ROLES}
 
     def _now(self) -> str:
         """返回带时区的当前时间字符串，秒级精度足够用于日志。"""
