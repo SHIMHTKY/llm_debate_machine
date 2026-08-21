@@ -123,18 +123,31 @@ class SupportManagerMixin:
     def _find_preset_by_name(self, settings: dict[str, Any], preset_name: str) -> dict[str, Any] | None:
         return support.find_preset_by_name(settings, preset_name)
 
+    def _find_preset(self, settings: dict[str, Any], preset_id: str, preset_name: str) -> dict[str, Any] | None:
+        return support.find_preset(settings, preset_id=preset_id, preset_name=preset_name)
+
     def _build_resume_settings(self, session: dict[str, Any]) -> dict[str, Any]:
         """恢复辩论时，强制按照原会话快照绑定的辩手配置继续执行。"""
 
+        session_id = str(session.get("id") or "").strip()
+        stored_settings = self.store.load_runtime_settings(session_id) if session_id else None
+        if isinstance(stored_settings, dict):
+            return deepcopy(stored_settings)
+
+        # 旧会话没有私有运行快照，只能继续使用兼容恢复逻辑。
         settings = load_settings()
         summary = session.get("config_summary") or {}
-        pro_name = str(((summary.get("pro") or {}) if isinstance(summary, dict) else {}).get("preset_name") or "").strip()
-        con_name = str(((summary.get("con") or {}) if isinstance(summary, dict) else {}).get("preset_name") or "").strip()
+        pro_summary = (summary.get("pro") or {}) if isinstance(summary, dict) else {}
+        con_summary = (summary.get("con") or {}) if isinstance(summary, dict) else {}
+        pro_id = str(pro_summary.get("preset_id") or "").strip()
+        con_id = str(con_summary.get("preset_id") or "").strip()
+        pro_name = str(pro_summary.get("preset_name") or "").strip()
+        con_name = str(con_summary.get("preset_name") or "").strip()
 
-        pro_preset = self._find_preset_by_name(settings, pro_name)
+        pro_preset = self._find_preset(settings, pro_id, pro_name)
         if pro_preset is None:
             raise DebateResumeError(f"请恢复{pro_name or '正方'}辩手配置后继续辩论。")
-        con_preset = self._find_preset_by_name(settings, con_name)
+        con_preset = self._find_preset(settings, con_id, con_name)
         if con_preset is None:
             raise DebateResumeError(f"请恢复{con_name or '反方'}辩手配置后继续辩论。")
 
@@ -142,6 +155,14 @@ class SupportManagerMixin:
         pro_preset["preset_name"] = pro_name or str(pro_preset.get("name") or "")
         con_preset["preset_id"] = str(con_preset.get("id") or "")
         con_preset["preset_name"] = con_name or str(con_preset.get("name") or "")
+        if isinstance(pro_summary.get("response_flow"), dict):
+            pro_preset["response_flow"] = deepcopy(pro_summary["response_flow"])
+        if isinstance(con_summary.get("response_flow"), dict):
+            con_preset["response_flow"] = deepcopy(con_summary["response_flow"])
+        if isinstance(pro_summary.get("tool_selection"), dict):
+            pro_preset["tool_selection"] = deepcopy(pro_summary["tool_selection"])
+        if isinstance(con_summary.get("tool_selection"), dict):
+            con_preset["tool_selection"] = deepcopy(con_summary["tool_selection"])
 
         return {
             "judge": deepcopy(settings.get("judge") or {}),

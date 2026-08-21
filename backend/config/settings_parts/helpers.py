@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 import json
 import re
 from typing import Any
@@ -14,6 +15,85 @@ from .constants import (
     MAX_CONTEXT_ROUNDS,
     MIN_CONTEXT_ROUNDS,
 )
+
+
+_SENSITIVE_KEYS = {
+    "apikey",
+    "authorization",
+    "auth",
+    "authtoken",
+    "bearertoken",
+    "clientsecret",
+    "cookie",
+    "credential",
+    "password",
+    "privatekey",
+    "proxyauthorization",
+    "refreshtoken",
+    "secret",
+    "secretkey",
+    "sessiontoken",
+    "securitytoken",
+    "token",
+    "xapikey",
+}
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+    if normalized in _SENSITIVE_KEYS:
+        return True
+    return normalized.endswith(
+        (
+            "apikey",
+            "accesstoken",
+            "authtoken",
+            "clientsecret",
+            "credential",
+            "password",
+            "privatekey",
+            "privatetoken",
+            "secret",
+            "secretkey",
+            "sessiontoken",
+            "securitytoken",
+        )
+    )
+
+
+def _mask_sensitive_values(value: Any, key: Any = "") -> Any:
+    """Return a structure safe for settings APIs, session data, and logs."""
+
+    if _is_sensitive_key(key):
+        return _mask_secret(value)
+    if isinstance(value, dict):
+        return {
+            child_key: _mask_sensitive_values(child_value, child_key)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_sensitive_values(item) for item in value]
+    return deepcopy(value)
+
+
+def _restore_masked_values(value: Any, existing_value: Any) -> Any:
+    """Replace frontend mask markers with the corresponding persisted values."""
+
+    if value == MASKED_SECRET and existing_value is not None:
+        return deepcopy(existing_value)
+    if isinstance(value, dict):
+        existing = existing_value if isinstance(existing_value, dict) else {}
+        return {
+            key: _restore_masked_values(child_value, existing.get(key))
+            for key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        existing = existing_value if isinstance(existing_value, list) else []
+        return [
+            _restore_masked_values(item, existing[index] if index < len(existing) else None)
+            for index, item in enumerate(value)
+        ]
+    return deepcopy(value)
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -82,7 +162,7 @@ def _normalize_extra_body(
     if value is None:
         return base_value
     if isinstance(value, dict):
-        return value.copy()
+        return _restore_masked_values(value, base_value)
 
     text = _text(value)
     if not text:
@@ -99,7 +179,7 @@ def _normalize_extra_body(
             last_error = exc
             continue
         if isinstance(parsed, dict):
-            return parsed.copy()
+            return _restore_masked_values(parsed, base_value)
         last_error = ValueError("extra_body must be an object")
 
     if strict:

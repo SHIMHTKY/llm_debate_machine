@@ -270,6 +270,26 @@ class LoggingMixin:
                 },
             )
 
+    def log_manual_thinking(self, role: str, step_name: str, content: str, max_tokens: int) -> None:
+        """Record the visible output of a manually orchestrated thinking block."""
+
+        text = str(content or "").strip()
+        if not text:
+            return
+        self._append_detail(
+            f"### 人工编排深度思考 · {step_name}\n\n"
+            f"- Token 上限：{max_tokens}\n\n"
+            f"{self._code_block(text)}\n\n"
+        )
+        self._append_pending_model_detail(
+            role,
+            {
+                "kind": "reasoning",
+                "title": f"人工编排 · {step_name}",
+                "entries": [{"source": "manual_flow.deep_thinking", "content": text}],
+            },
+        )
+
     def log_detail(self, source: str, message: str, data: Any = None) -> None:
         """记录普通运行信息。"""
 

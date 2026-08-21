@@ -52,6 +52,8 @@ class LinearDebateGraph:
                     self.context["pro_tool_mode"],
                     self.context["pro_max_tool_rounds"],
                     self.context["pro_tool_fallback_enabled"],
+                    self.context["pro_response_flow"],
+                    self.context["pro_manual_tools"],
                 )
             elif phase == "con_first_speech":
                 updates = await con_first_speech(
@@ -62,6 +64,8 @@ class LinearDebateGraph:
                     self.context["con_tool_mode"],
                     self.context["con_max_tool_rounds"],
                     self.context["con_tool_fallback_enabled"],
+                    self.context["con_response_flow"],
+                    self.context["con_manual_tools"],
                 )
             elif phase == "pro_speech":
                 updates = await pro_speech(
@@ -73,6 +77,8 @@ class LinearDebateGraph:
                     self.context["history_window_size"],
                     self.context["pro_max_tool_rounds"],
                     self.context["pro_tool_fallback_enabled"],
+                    self.context["pro_response_flow"],
+                    self.context["pro_manual_tools"],
                 )
             elif phase == "con_speech":
                 updates = await con_speech(
@@ -84,6 +90,8 @@ class LinearDebateGraph:
                     self.context["history_window_size"],
                     self.context["con_max_tool_rounds"],
                     self.context["con_tool_fallback_enabled"],
+                    self.context["con_response_flow"],
+                    self.context["con_manual_tools"],
                 )
             elif phase == "judge_summary":
                 updates = await judge_summary(runtime, self.logger, self.context["judge_llm"])

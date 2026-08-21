@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import re
 import traceback
 
 from ...config.settings import load_settings, public_settings_summary
+from ...config.settings_parts.helpers import _is_sensitive_key
 from ...debate.engine import (
     build_runtime_result,
     create_runtime_state,
@@ -16,6 +19,33 @@ from ...debate.engine import (
 )
 from ...debate.logger import DebateLogger
 from .base import DebateCapacityError, DebateStateError
+
+
+def _configured_secrets(settings: dict) -> set[str]:
+    secrets: set[str] = set()
+
+    def visit(value, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                visit(child_value, str(child_key).strip().lower())
+        elif isinstance(value, list):
+            for child_value in value:
+                visit(child_value, key)
+        elif _is_sensitive_key(key):
+            secret = str(value or "")
+            if len(secret) >= 4:
+                secrets.add(secret)
+
+    visit(settings)
+    return secrets
+
+
+def _redact_sensitive_text(value: str, settings: dict) -> str:
+    text = str(value or "")
+    for secret in sorted(_configured_secrets(settings), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    return text
 
 
 class RuntimeManagerMixin:
@@ -38,6 +68,7 @@ class RuntimeManagerMixin:
                 min_rounds=min_rounds,
                 max_rounds=max_rounds,
                 config_summary=public_settings_summary(settings),
+                runtime_settings=settings,
             )
             # 会话一创建出来，就立刻落一份最初 runtime_state，方便后续恢复和回放。
             self.store.set_runtime_state(session["id"], create_runtime_state(topic, min_rounds, max_rounds))
@@ -83,27 +114,24 @@ class RuntimeManagerMixin:
     async def resume_debate(self, session_id: str) -> dict | None:
         """从 `paused` 状态重新拉起后台任务。"""
 
-        session = self.store.load_session(session_id)
-        if session is None:
-            return None
-        if self.is_running(session_id):
-            return session
-        if session.get("status") != "paused":
-            raise DebateStateError("当前辩论不处于暂停状态。")
-
-        settings = self._build_resume_settings(session)
-        # 暂停期间编辑完成但尚未继续的用户消息，在恢复前要先锁死。
-        self._lock_draft_user_message(session_id)
-        self.store.set_live_status(session_id, None)
-        self.store.set_status(session_id, "running")
-        self._publish_session_state(session_id)
-
         async with self._task_lock:
             self._prune_finished_tasks()
+            session = self.store.load_session(session_id)
+            if session is None:
+                return None
+            if self.is_running(session_id):
+                return session
+            if session.get("status") != "paused":
+                raise DebateStateError("当前辩论不处于暂停状态。")
             if self.running_count() >= self.MAX_CONCURRENT_DEBATES:
-                self.store.set_status(session_id, "paused")
-                self._publish_session_state(session_id)
                 raise DebateCapacityError("已到当前进程上限。")
+
+            settings = self._build_resume_settings(session)
+            # State transition and task creation share the lock, preventing double resume.
+            self._lock_draft_user_message(session_id)
+            self.store.set_live_status(session_id, None)
+            self.store.set_status(session_id, "running")
+            self._publish_session_state(session_id)
             task = asyncio.create_task(
                 self._run_session(
                     session_id=session_id,
@@ -112,7 +140,8 @@ class RuntimeManagerMixin:
                     max_rounds=int(session.get("max_rounds") or 1),
                     settings=settings,
                     resumed=True,
-                )
+                ),
+                name=f"debate:{session_id}",
             )
             self.tasks[session_id] = task
         return self.store.load_session(session_id)
@@ -201,7 +230,6 @@ class RuntimeManagerMixin:
         self.store.set_status(session_id, "running")
         session = self.store.load_session(session_id) or {}
         runtime = self._build_runtime_from_session(session)
-        context = prepare_runtime_context(settings)
         logger = DebateLogger(
             session_id=session_id,
             topic=topic,
@@ -209,12 +237,13 @@ class RuntimeManagerMixin:
             metrics_enabled=bool(settings.get("usage_tracking_enabled")),
         )
 
-        if not resumed and str(runtime.get("phase") or "judge_initialize") == "judge_initialize" and not (session.get("messages") or []):
-            logger.log_debate_start(topic, min_rounds, max_rounds, public_settings_summary(settings))
-        elif resumed:
-            self.store.append_detail_note(session_id, "继续辩论", "已恢复辩论，继续按照原顺序发言。")
-
         try:
+            context = prepare_runtime_context(settings)
+            if not resumed and str(runtime.get("phase") or "judge_initialize") == "judge_initialize" and not (session.get("messages") or []):
+                logger.log_debate_start(topic, min_rounds, max_rounds, public_settings_summary(settings))
+            elif resumed:
+                self.store.append_detail_note(session_id, "继续辩论", "已恢复辩论，继续按照原顺序发言。")
+
             # usage_cursor 表示“上一阶段结束后的累计用量快照”。
             # 每完成一阶段，都用新快照减旧快照，得到本阶段独有的增量。
             usage_cursor = logger.build_usage_summary()
@@ -222,14 +251,19 @@ class RuntimeManagerMixin:
             while str(runtime.get("phase") or "judge_initialize") != "completed":
                 current_phase = str(runtime.get("phase") or "judge_initialize")
 
-                before_messages = self.store.load_session(session_id) or {}
-                previous_message_ids = {
-                    str(message.get("id") or "").strip()
-                    for message in (before_messages.get("messages") or [])
-                    if str(message.get("id") or "").strip()
-                }
-
-                updates = await run_runtime_phase(runtime, context, logger)
+                self._begin_phase_event_buffer(session_id)
+                begin_detail_transaction = getattr(logger, "begin_detail_transaction", None)
+                if callable(begin_detail_transaction):
+                    begin_detail_transaction()
+                try:
+                    updates = await run_runtime_phase(runtime, context, logger)
+                except BaseException:
+                    self._discard_phase_event_buffer(session_id)
+                    discard_detail_transaction = getattr(logger, "discard_detail_transaction", None)
+                    if callable(discard_detail_transaction):
+                        discard_detail_transaction()
+                    raise
+                phase_events = self._take_phase_event_buffer(session_id)
                 usage_summary = logger.build_usage_summary()
                 usage_delta = self._diff_usage_summaries(usage_cursor, usage_summary)
 
@@ -237,13 +271,32 @@ class RuntimeManagerMixin:
 
                 # 某些阶段会新落一条模型消息；这里把它和该阶段 usage 绑定起来，
                 # 后续撤回 / 恢复辩论时才能精确重算 token。
-                message_id = self._resolve_new_message_id(session_id, previous_message_ids)
+                message_id = next(
+                    (
+                        str(event.get("id") or "").strip()
+                        for event in reversed(phase_events)
+                        if str(event.get("type") or "") in {"message", "summary"}
+                        and str(event.get("id") or "").strip()
+                    ),
+                    None,
+                )
                 self._append_usage_timeline_entry(runtime, phase=current_phase, usage_delta=usage_delta, message_id=message_id)
                 if message_id and usage_delta is not None:
-                    self._attach_message_usage(session_id, message_id, usage_delta, current_phase)
+                    for event in phase_events:
+                        if str(event.get("id") or "").strip() == message_id:
+                            event["usage_delta"] = deepcopy(usage_delta)
+                            event["usage_phase"] = current_phase
 
                 runtime["phase"] = determine_next_phase(runtime, current_phase)
-                self.store.set_runtime_state(session_id, runtime)
+                if self.store.commit_runtime_phase(session_id, runtime, phase_events) is None:
+                    discard_detail_transaction = getattr(logger, "discard_detail_transaction", None)
+                    if callable(discard_detail_transaction):
+                        discard_detail_transaction()
+                    raise RuntimeError("辩论会话已不存在，无法提交当前阶段。")
+                commit_detail_transaction = getattr(logger, "commit_detail_transaction", None)
+                if callable(commit_detail_transaction):
+                    commit_detail_transaction()
+                self._broadcast_committed_phase_events(session_id, phase_events)
                 self._publish_session_state(session_id)
 
                 # 如果运行中已有挂起用户消息，则在当前辩手说完后把它正式插入历史。
@@ -263,6 +316,10 @@ class RuntimeManagerMixin:
             self.store.set_status(session_id, "completed")
             self._publish(session_id, {"type": "done", "role": "system", "label": "系统", "content": "辩论已完成。", "persist": False})
         except asyncio.CancelledError:
+            self._discard_phase_event_buffer(session_id)
+            discard_detail_transaction = getattr(logger, "discard_detail_transaction", None)
+            if callable(discard_detail_transaction):
+                discard_detail_transaction()
             logger.log_usage_summary()
             command = self.task_commands.get(session_id, {})
             action = str(command.get("action") or "terminate")
@@ -285,8 +342,12 @@ class RuntimeManagerMixin:
                 )
             return
         except Exception as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
-            traceback_text = traceback.format_exc()
+            self._discard_phase_event_buffer(session_id)
+            discard_detail_transaction = getattr(logger, "discard_detail_transaction", None)
+            if callable(discard_detail_transaction):
+                discard_detail_transaction()
+            error_message = _redact_sensitive_text(f"{type(exc).__name__}: {exc}", settings)
+            traceback_text = _redact_sensitive_text(traceback.format_exc(), settings)
             logger.log_error(error_message, traceback_text)
             logger.log_usage_summary()
             self.store.set_record_paths(
@@ -299,6 +360,12 @@ class RuntimeManagerMixin:
             self._publish(session_id, {"type": "done", "role": "system", "label": "系统", "content": "辩论已中断。", "persist": False})
             return
         finally:
+            self._discard_phase_event_buffer(session_id)
+            discard_detail_transaction = getattr(logger, "discard_detail_transaction", None)
+            if callable(discard_detail_transaction):
+                discard_detail_transaction()
             async with self._task_lock:
-                self.tasks.pop(session_id, None)
-                self.task_commands.pop(session_id, None)
+                current_task = asyncio.current_task()
+                if self.tasks.get(session_id) is current_task:
+                    self.tasks.pop(session_id, None)
+                    self.task_commands.pop(session_id, None)

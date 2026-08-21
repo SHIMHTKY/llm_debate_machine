@@ -67,6 +67,28 @@ class BaseDebateLogger:
         self._usage_stats = self._create_usage_stats()
         # 暂存一次可见消息产生前的模型调用链，消息落盘时会写入 message.details。
         self._pending_model_details: dict[str, list[dict[str, Any]]] = {role: [] for role in TRACKED_ROLES}
+        # A debate phase buffers its detail log until the session/runtime commit succeeds.
+        self._detail_transaction: list[str] | None = None
+
+    def begin_detail_transaction(self) -> None:
+        """Buffer detail-log entries produced by the current runtime phase."""
+
+        self._detail_transaction = []
+
+    def commit_detail_transaction(self) -> None:
+        """Append the completed phase detail block after its state commit."""
+
+        entries = self._detail_transaction
+        self._detail_transaction = None
+        if not entries:
+            return
+        with self.detail_log_file.open("a", encoding="utf-8") as file:
+            file.write("".join(entries))
+
+    def discard_detail_transaction(self) -> None:
+        """Discard detail entries from an interrupted or failed phase."""
+
+        self._detail_transaction = None
 
     def _now(self) -> str:
         """返回带时区的当前时间字符串，秒级精度足够用于日志。"""
@@ -86,6 +108,9 @@ class BaseDebateLogger:
     def _append_detail(self, text: str) -> None:
         """向 detail 日志文件追加文本。"""
 
+        if self._detail_transaction is not None:
+            self._detail_transaction.append(text)
+            return
         with self.detail_log_file.open("a", encoding="utf-8") as file:
             file.write(text)
 

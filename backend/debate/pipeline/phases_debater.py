@@ -36,6 +36,8 @@ async def pro_first_speech(
     tool_mode: str,
     max_tool_rounds: int,
     tool_fallback_enabled: bool,
+    response_flow: dict[str, Any] | None = None,
+    manual_tools: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """正方开篇立论。"""
 
@@ -65,6 +67,8 @@ async def pro_first_speech(
         "开篇立论",
         max_tool_rounds,
         tool_fallback_enabled,
+        response_flow,
+        manual_tools,
     )
     speech_text, _ = normalize_debater_response(response_text, allow_concede=False)
 
@@ -85,6 +89,8 @@ async def con_first_speech(
     tool_mode: str,
     max_tool_rounds: int,
     tool_fallback_enabled: bool,
+    response_flow: dict[str, Any] | None = None,
+    manual_tools: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """反方开篇立论。"""
 
@@ -110,6 +116,8 @@ async def con_first_speech(
         "开篇立论",
         max_tool_rounds,
         tool_fallback_enabled,
+        response_flow,
+        manual_tools,
     )
     speech_text, _ = normalize_debater_response(response_text, allow_concede=False)
 
@@ -130,6 +138,8 @@ async def pro_speech(
     history_window_size: int,
     max_tool_rounds: int,
     tool_fallback_enabled: bool,
+    response_flow: dict[str, Any] | None = None,
+    manual_tools: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """正方常规轮次发言。"""
 
@@ -159,6 +169,8 @@ async def pro_speech(
         f"第 {round_num} 轮发言",
         max_tool_rounds,
         tool_fallback_enabled,
+        response_flow,
+        manual_tools,
     )
     speech_text, conceded = normalize_debater_response(response_text, allow_concede=can_concede)
 
@@ -184,6 +196,8 @@ async def con_speech(
     history_window_size: int,
     max_tool_rounds: int,
     tool_fallback_enabled: bool,
+    response_flow: dict[str, Any] | None = None,
+    manual_tools: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """反方常规轮次发言。"""
 
@@ -212,6 +226,8 @@ async def con_speech(
         f"第 {round_num} 轮发言",
         max_tool_rounds,
         tool_fallback_enabled,
+        response_flow,
+        manual_tools,
     )
     speech_text, conceded = normalize_debater_response(response_text, allow_concede=can_concede)
 

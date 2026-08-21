@@ -10,10 +10,11 @@ echo ============================================
 echo.
 echo 这个脚本会永久清理本项目目录中的以下内容：
 echo 1. 所有辩论记录：data\debates\*.json
-echo 2. 所有详情/错误日志：logs\details\*.md、logs\errors\*.md
-echo 3. 历史旧日志：logs\debate_*_detail.log、logs\debate_*_simple.log
-echo 4. 所有本地软配置与 API Key：data\settings.json
-echo 5. 项目目录中的 .env（如果存在）
+echo 2. 辩论运行配置快照：data\runtime_configs\*.json
+echo 3. 所有详情/错误日志：logs\details\*.md、logs\errors\*.md
+echo 4. 历史旧日志：logs\debate_*_detail.log、logs\debate_*_simple.log
+echo 5. 所有本地软配置与 API Key：data\settings.json 及损坏备份
+echo 6. 项目目录中的 .env（如果存在）
 echo.
 echo 注意：该操作不可恢复。
 echo.
@@ -32,17 +33,20 @@ echo 正在清理项目数据...
 
 if not exist "data" mkdir "data"
 if not exist "data\debates" mkdir "data\debates"
+if not exist "data\runtime_configs" mkdir "data\runtime_configs"
 if not exist "logs" mkdir "logs"
 if not exist "logs\details" mkdir "logs\details"
 if not exist "logs\errors" mkdir "logs\errors"
 
 del /q /f "data\debates\*.json" 2>nul
+del /q /f "data\runtime_configs\*.json" 2>nul
 del /q /f "logs\details\*.md" 2>nul
 del /q /f "logs\errors\*.md" 2>nul
 del /q /f "logs\debate_*_detail.log" 2>nul
 del /q /f "logs\debate_*_simple.log" 2>nul
 
 if exist "data\settings.json" del /q /f "data\settings.json"
+del /q /f "data\settings.json.corrupt-*" 2>nul
 if exist ".env" del /q /f ".env"
 if exist "__pycache__" rmdir /s /q "__pycache__"
 

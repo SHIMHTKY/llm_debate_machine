@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import uuid
 from datetime import datetime
@@ -17,6 +18,7 @@ class SessionDataMixin:
         min_rounds: int,
         max_rounds: int,
         config_summary: dict[str, Any],
+        runtime_settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         session = {
@@ -37,6 +39,7 @@ class SessionDataMixin:
             "detail_record_path": None,
             "error_record_path": None,
             "config_summary": config_summary,
+            "runtime_config_version": 1 if isinstance(runtime_settings, dict) else None,
             "usage_stats": None,
             "archived": False,
             "archived_at": None,
@@ -44,7 +47,14 @@ class SessionDataMixin:
             "active_user_message": None,
         }
         with self._lock:
-            return self._write_session(session)
+            runtime_path = self._runtime_config_path(session_id)
+            try:
+                if isinstance(runtime_settings, dict):
+                    self._atomic_write_json(runtime_path, deepcopy(runtime_settings))
+                return self._write_session(session)
+            except Exception:
+                runtime_path.unlink(missing_ok=True)
+                raise
 
     def update_session(self, session_id: str, updater) -> dict[str, Any] | None:
         with self._lock:
@@ -59,16 +69,23 @@ class SessionDataMixin:
 
     def load_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
-            return self._normalize_session(self._read_session_unlocked(session_id))
+            raw_session = self._read_session_unlocked(session_id)
+            normalized = self._normalize_session(raw_session)
+            if normalized is not None and normalized != raw_session:
+                return self._write_session(normalized)
+            return normalized
 
     def list_sessions(self, archived: bool = False) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
         with self._lock:
             for path in self.session_dir.glob("*.json"):
                 try:
-                    session = self._normalize_session(json.loads(path.read_text(encoding="utf-8")))
+                    payload = json.loads(path.read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(payload, dict):
+                    continue
+                session = self._normalize_session(payload)
                 if bool(session.get("archived")) != archived:
                     continue
                 sessions.append(session)
@@ -111,6 +128,49 @@ class SessionDataMixin:
             session.setdefault("messages", []).append(message)
             session["updated_at"] = self._now()
             return self._write_session(session)
+
+    def commit_runtime_phase(
+        self,
+        session_id: str,
+        runtime_state: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Persist one completed phase as a single session-file replacement."""
+
+        with self._lock:
+            session = self._read_session_unlocked(session_id)
+            if session is None:
+                return None
+            existing_messages = session.get("messages") if isinstance(session.get("messages"), list) else []
+            existing_ids = {
+                str(message.get("id") or "")
+                for message in existing_messages
+                if isinstance(message, dict) and str(message.get("id") or "")
+            }
+            committed_messages = [
+                deepcopy(message)
+                for message in messages
+                if isinstance(message, dict) and str(message.get("id") or "") not in existing_ids
+            ]
+            session["messages"] = [*existing_messages, *committed_messages]
+            session["runtime_state"] = deepcopy(runtime_state)
+            if committed_messages:
+                session["live_status"] = None
+            session["updated_at"] = self._now()
+            return self._write_session(session)
+
+    def load_runtime_settings(self, session_id: str) -> dict[str, Any] | None:
+        """Load the private immutable runtime configuration for a debate."""
+
+        with self._lock:
+            path = self._runtime_config_path(session_id)
+            if not path.exists():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return None
+            return deepcopy(payload) if isinstance(payload, dict) else None
 
     def set_live_status(self, session_id: str, live_status: dict[str, Any] | None) -> dict[str, Any] | None:
         with self._lock:

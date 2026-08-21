@@ -47,6 +47,16 @@ def _default_tool_selection() -> dict[str, Any]:
     }
 
 
+def _default_response_flow() -> dict[str, Any]:
+    return {
+        "mode": "autonomous",
+        "blocks": [
+            {"id": "flow_start", "type": "start"},
+            {"id": "flow_final", "type": "final_response"},
+        ],
+    }
+
+
 def _default_model(role: str) -> dict[str, Any]:
     azure_api_key = _text(os.getenv("AZURE_OPENAI_API_KEY"))
     azure_base_url = _text(os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_OPENAI_BASE_URL"))
@@ -106,6 +116,7 @@ def _preset_from_model(name: str, model_config: dict[str, Any], supplier_id: str
         "max_tokens": int(model_config.get("max_tokens") or 8000),
         "extra_body": deepcopy(model_config.get("extra_body")) if isinstance(model_config.get("extra_body"), dict) else {},
         "tool_selection": _default_tool_selection(),
+        "response_flow": _default_response_flow(),
     }
 
 

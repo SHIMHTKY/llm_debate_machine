@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from .constants import DEFAULT_CONTEXT_ROUNDS, MAX_DEBATER_PRESETS
-from .helpers import _coerce_bool, _mask_secret, _normalize_context_rounds, _text
+from .helpers import _coerce_bool, _mask_secret, _mask_sensitive_values, _normalize_context_rounds, _text
 from .normalize import MAX_MODEL_SUPPLIERS, MAX_TOOL_CONFIGS
 from .storage import _load_raw_settings, _save_raw_settings
 
@@ -17,6 +17,8 @@ def _frontend_model(config: dict[str, Any], *, include_search: bool) -> dict[str
     masked = deepcopy(config)
     masked["api_key"] = _mask_secret(config.get("api_key"))
     masked["has_api_key"] = bool(_text(config.get("api_key")))
+    if isinstance(config.get("extra_body"), dict):
+        masked["extra_body"] = _mask_sensitive_values(config["extra_body"])
     if include_search:
         search = masked.get("search", {})
         real_search = config.get("search", {}) if isinstance(config.get("search"), dict) else {}
@@ -63,8 +65,9 @@ def settings_for_frontend(raw_settings: dict[str, Any]) -> dict[str, Any]:
                 "model": preset.get("model", ""),
                 "azure_deployment": preset.get("azure_deployment", ""),
                 "max_tokens": preset.get("max_tokens"),
-                "extra_body": deepcopy(preset.get("extra_body")) if isinstance(preset.get("extra_body"), dict) else {},
+                "extra_body": _mask_sensitive_values(preset.get("extra_body")) if isinstance(preset.get("extra_body"), dict) else {},
                 "tool_selection": deepcopy(preset.get("tool_selection")) if isinstance(preset.get("tool_selection"), dict) else {},
+                "response_flow": deepcopy(preset.get("response_flow")) if isinstance(preset.get("response_flow"), dict) else {},
             }
             for preset in raw_settings.get("debater_presets", [])
         ],
@@ -106,7 +109,7 @@ def public_settings_summary(settings: dict[str, Any]) -> dict[str, Any]:
             "max_tokens": config.get("max_tokens"),
             "timeout": config.get("timeout"),
             "max_retries": config.get("max_retries"),
-            "extra_body": deepcopy(config.get("extra_body")) if isinstance(config.get("extra_body"), dict) else {},
+            "extra_body": _mask_sensitive_values(config.get("extra_body")) if isinstance(config.get("extra_body"), dict) else {},
             "has_api_key": bool(_text(config.get("api_key"))),
         }
         if role in {"pro", "con"}:
@@ -127,7 +130,8 @@ def public_settings_summary(settings: dict[str, Any]) -> dict[str, Any]:
                 "tool_template_id": search.get("tool_template_id"),
                 "tool_type": search.get("tool_type"),
             }
-            summary["tool_selection"] = deepcopy(config.get("tool_selection")) if isinstance(config.get("tool_selection"), dict) else {}
+            summary["tool_selection"] = _mask_sensitive_values(config.get("tool_selection")) if isinstance(config.get("tool_selection"), dict) else {}
+            summary["response_flow"] = _mask_sensitive_values(config.get("response_flow")) if isinstance(config.get("response_flow"), dict) else {}
         return summary
 
     return {

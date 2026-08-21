@@ -2,13 +2,21 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class DebateStartRequest(BaseModel):
     topic: str = Field(min_length=1, max_length=500)
     min_rounds: int = Field(default=4, ge=2, le=10)
     max_rounds: int = Field(default=6, ge=2, le=10)
+
+    @field_validator("topic")
+    @classmethod
+    def validate_topic(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("辩题不能为空。")
+        return cleaned
 
     @model_validator(mode="after")
     def validate_rounds(self) -> "DebateStartRequest":
@@ -21,6 +29,14 @@ class DebateUserMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     target_role: Literal["pro", "con"] | None = None
 
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("用户消息不能为空。")
+        return cleaned
+
 
 class DebateRewindRequest(BaseModel):
     message_id: str = Field(min_length=1, max_length=128)
@@ -29,6 +45,14 @@ class DebateRewindRequest(BaseModel):
 
 class DebateTitleUpdateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=80)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("标题不能为空。")
+        return cleaned
 
 
 class MessageDetailViewRequest(BaseModel):

@@ -20,6 +20,48 @@ from typing import Any
 class EventManagerMixin:
     """负责事件标准化、广播以及 SSE 输出。"""
 
+    def _begin_phase_event_buffer(self, session_id: str) -> None:
+        """Start buffering persistent events until the current phase commits."""
+
+        self._phase_event_buffers[session_id] = []
+
+    def _take_phase_event_buffer(self, session_id: str) -> list[dict[str, Any]]:
+        """Return and clear the persistent events buffered for one phase."""
+
+        return self._phase_event_buffers.pop(session_id, [])
+
+    def _discard_phase_event_buffer(self, session_id: str) -> None:
+        """Drop events from a phase that did not complete successfully."""
+
+        self._phase_event_buffers.pop(session_id, None)
+
+    def _broadcast_committed_phase_events(self, session_id: str, events: list[dict[str, Any]]) -> None:
+        """Broadcast phase events only after their session transaction is durable."""
+
+        for event in events:
+            self._push_event(session_id, {**event, "persist": False})
+
+    SSE_HEARTBEAT_SECONDS = 15
+
+    def _enqueue_event(self, queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
+        """Keep slow subscribers bounded while preserving the newest state."""
+
+        try:
+            queue.put_nowait(event)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # A concurrent producer won the slot; a later session snapshot will resync the UI.
+            pass
+
     def _enrich_event(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """补齐前端事件依赖的公共字段。"""
 
@@ -37,8 +79,8 @@ class EventManagerMixin:
         """
 
         event = self._enrich_event(session_id, payload)
-        for queue in self.subscribers.get(session_id, []):
-            queue.put_nowait(event)
+        for queue in list(self.subscribers.get(session_id, [])):
+            self._enqueue_event(queue, event)
         return event
 
     def _publish(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -56,10 +98,15 @@ class EventManagerMixin:
 
         # 只有 persist 事件才应写入 session.messages。
         if event.get("persist"):
-            self.store.append_message(session_id, event)
+            phase_buffer = self._phase_event_buffers.get(session_id)
+            if phase_buffer is not None:
+                phase_buffer.append(event)
+                return event
+            else:
+                self.store.append_message(session_id, event)
 
-        for queue in self.subscribers.get(session_id, []):
-            queue.put_nowait(event)
+        for queue in list(self.subscribers.get(session_id, [])):
+            self._enqueue_event(queue, event)
         return event
 
     def _publish_session_state(self, session_id: str) -> dict[str, Any] | None:
@@ -107,12 +154,17 @@ class EventManagerMixin:
             )
             return
 
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self.SUBSCRIBER_QUEUE_SIZE)
         self.subscribers.setdefault(session_id, []).append(queue)
 
         try:
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=self.SSE_HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    # SSE comments keep idle connections alive without creating frontend events.
+                    yield ": keep-alive\n\n"
+                    continue
                 yield self._format_sse(event)
                 if event.get("type") == "done":
                     break

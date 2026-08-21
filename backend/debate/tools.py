@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import os
-import threading
 from typing import Any
 
 from dotenv import load_dotenv
@@ -12,6 +11,8 @@ DEFAULT_TIMEOUT = 60
 DEFAULT_OUTPUT_TRUNCATE_CHARS = 2500
 MIN_OUTPUT_TRUNCATE_CHARS = 500
 MAX_OUTPUT_TRUNCATE_CHARS = 20000
+MAX_TIMEOUT = 300
+VALID_SEARCH_DEPTHS = {"basic", "advanced", "fast", "ultra-fast"}
 
 
 def _clean_text(value: Any) -> str:
@@ -19,27 +20,6 @@ def _clean_text(value: Any) -> str:
         return ""
     text = str(value).strip()
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())
-
-
-def _run_callable_with_timeout(func, timeout: int) -> dict[str, Any]:
-    result_box: dict[str, Any] = {}
-    error_box: dict[str, Exception] = {}
-
-    def runner() -> None:
-        try:
-            result_box["value"] = func()
-        except Exception as exc:
-            error_box["error"] = exc
-
-    thread = threading.Thread(target=runner, daemon=True)
-    thread.start()
-    thread.join(timeout=max(1, int(timeout)))
-
-    if thread.is_alive():
-        return {"success": False, "error": "搜索请求超时。"}
-    if "error" in error_box:
-        return {"success": False, "error": f"搜索工具异常：{error_box['error']}"}
-    return {"success": True, "data": result_box.get("value")}
 
 
 def _normalize_output_truncate_chars(value: Any) -> int:
@@ -107,20 +87,34 @@ def tavily_api_search(
     if not tavily_key:
         return {"success": False, "error": "未配置 Tavily API Key。"}
 
-    depth = _clean_text(search_depth) or DEFAULT_SEARCH_DEPTH
-    result_limit = max(1, min(int(max_results or 5), 10))
+    depth = (_clean_text(search_depth) or DEFAULT_SEARCH_DEPTH).lower()
+    if depth not in VALID_SEARCH_DEPTHS:
+        depth = DEFAULT_SEARCH_DEPTH
+    try:
+        result_limit = int(max_results or 5)
+    except (TypeError, ValueError):
+        result_limit = 5
+    result_limit = max(1, min(result_limit, 10))
+    try:
+        request_timeout = int(timeout or DEFAULT_TIMEOUT)
+    except (TypeError, ValueError):
+        request_timeout = DEFAULT_TIMEOUT
+    request_timeout = max(1, min(request_timeout, MAX_TIMEOUT))
 
-    def search_call():
+    try:
         from tavily import TavilyClient
 
         client = TavilyClient(tavily_key)
-        return client.search(query=cleaned_query, search_depth=depth, max_results=result_limit)
+        response = client.search(
+            query=cleaned_query,
+            search_depth=depth,
+            max_results=result_limit,
+            timeout=request_timeout,
+        )
+    except Exception as exc:
+        return {"success": False, "error": f"搜索工具异常：{exc}"}
 
-    response = _run_callable_with_timeout(search_call, timeout=timeout)
-    if not response.get("success"):
-        return {"success": False, "error": response.get("error", "未知错误。")}
-
-    payload = response.get("data") if isinstance(response.get("data"), dict) else {}
+    payload = response if isinstance(response, dict) else {}
     items = _normalize_items(payload)
     return {
         "success": True,
@@ -181,7 +175,38 @@ def create_search_tools(search_settings: dict[str, Any]) -> list[Any]:
 
     web_search.metadata = {
         **(web_search.metadata or {}),
+        "config_id": _clean_text(search_settings.get("tool_id")),
         "output_truncate_chars": output_truncate_chars,
     }
     return [web_search]
+
+
+def create_manual_tool_map(model_settings: dict[str, Any], tool_configs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build tools keyed by saved config ID for deterministic manual flows."""
+
+    selection = model_settings.get("tool_selection") if isinstance(model_settings.get("tool_selection"), dict) else {}
+    enabled_ids = selection.get("enabled_tool_ids") if isinstance(selection.get("enabled_tool_ids"), list) else []
+    configs_by_id = {
+        _clean_text(config.get("id")): config
+        for config in tool_configs
+        if isinstance(config, dict) and _clean_text(config.get("id"))
+    }
+    tools_by_id: dict[str, Any] = {}
+    for raw_tool_id in enabled_ids:
+        tool_id = _clean_text(raw_tool_id)
+        config = configs_by_id.get(tool_id)
+        if not config or not config.get("enabled"):
+            continue
+        tool_type = _clean_text(config.get("template_id") or config.get("type")).lower()
+        if tool_type != "tavily_search":
+            continue
+        search_settings = {
+            **config,
+            "enabled": True,
+            "tool_id": tool_id,
+        }
+        tools = create_search_tools(search_settings)
+        if tools:
+            tools_by_id[tool_id] = tools[0]
+    return tools_by_id
 

@@ -8,10 +8,17 @@
 
 const MODAL_MOTION_MS = 180;
 const SESSION_SUMMARY_REFRESH_MS = 2000;
+const SESSION_LIST_REFRESH_DEBOUNCE_MS = 320;
+const DEFAULT_API_TIMEOUT_MS = 45000;
+const EXPORT_API_TIMEOUT_MS = 90000;
+const MODEL_TASK_API_TIMEOUT_MS = 360000;
 const NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
 const DEFAULT_CONTEXT_ROUNDS = 3;
 const MIN_CONTEXT_ROUNDS = 2;
 const MAX_CONTEXT_ROUNDS = 6;
+const RESPONSE_FLOW_MAX_BLOCKS = 10;
+const RESPONSE_FLOW_MIN_THINKING_TOKENS = 128;
+const RESPONSE_FLOW_MAX_THINKING_TOKENS = 32768;
 const TOOL_TEMPLATES = [
   {
     id: "tavily_search",
@@ -46,10 +53,8 @@ const state = {
   settings: null,
   sessions: [],
   archivedSessions: [],
-  records: { detail: [], error: [] },
   currentSession: null,
   currentSessionId: null,
-  currentRecord: null,
   typing: null,
   eventSource: null,
   eventSourceSessionId: "",
@@ -62,6 +67,8 @@ const state = {
   utilityModelSwitcherOpen: false,
   presetManagerOpen: false,
   presetManagerTab: "debater",
+  responseFlowEditorOpen: false,
+  responseFlowDraggingBlockId: "",
   expandedToolChoiceIds: {},
   noticeText: "",
   workspaceText: "",
@@ -76,15 +83,24 @@ const state = {
   editingTitleSessionId: "",
   savingTitleSessionId: "",
   savingHomeBinding: false,
+  settingsSnapshot: null,
+  settingsDarkModeSnapshot: false,
   settingsModalTimer: null,
   archivedModalTimer: null,
   markdownPreviewModalTimer: null,
+  markdownPreviewRequestId: 0,
+  markdownPreviewController: null,
   markdownPreview: null,
   messageDetailModalTimer: null,
   messageDetailLoadingKey: "",
+  messageDetailTask: null,
   messageDetail: null,
   sessionSummaryRefreshTimer: null,
   sessionSummaryRefreshInFlight: false,
+  sessionListRequestId: 0,
+  sessionListRefreshTimer: null,
+  sessionOpenRequestId: 0,
+  sessionOpenController: null,
   reviewTopicExpanded: false,
   expandedEvaluationGroups: {},
   userMessageTargetRole: "",
@@ -92,7 +108,6 @@ const state = {
   userTargetSubmenuOpen: false,
   userTargetSubmenuCloseTimer: null,
   userComposerDisabled: false,
-  currentView: "debate",
   currentDebateMode: "",
   presetManagerEntering: false,
 };
@@ -106,8 +121,21 @@ async function init() {
   applyTheme(state.darkMode);
   cacheElements();
   bindEvents();
-  await Promise.all([loadSettings(), loadSessions(), loadArchivedSessions(), loadRecords(), loadNotice(), loadWorkspace()]);
+  const initialLoads = [
+    ["设置", loadSettings],
+    ["会话", loadSessions],
+    ["归档", loadArchivedSessions],
+    ["须知", loadNotice],
+    ["工作区", loadWorkspace],
+  ];
+  const results = await Promise.allSettled(initialLoads.map(([, loader]) => loader()));
   renderCurrentSession();
+  const failedLabels = results
+    .map((result, index) => (result.status === "rejected" ? initialLoads[index][0] : ""))
+    .filter(Boolean);
+  if (failedLabels.length) {
+    showLocalError(`部分数据加载失败：${failedLabels.join("、")}。请检查服务状态后刷新页面。`);
+  }
 }
 
 function cacheElements() {
@@ -161,6 +189,9 @@ function cacheElements() {
   els.messageDetailEyebrow = document.getElementById("messageDetailEyebrow");
   els.messageDetailTitle = document.getElementById("messageDetailTitle");
   els.messageDetailBody = document.getElementById("messageDetailBody");
+  els.detailTextTaskBar = document.getElementById("detailTextTaskBar");
+  els.detailTextTaskLabel = document.getElementById("detailTextTaskLabel");
+  els.cancelDetailTextTaskBtn = document.getElementById("cancelDetailTextTaskBtn");
   els.titleEditModal = document.getElementById("titleEditModal");
   els.titleEditInput = document.getElementById("titleEditInput");
   els.cancelTitleEditBtn = document.getElementById("cancelTitleEditBtn");
@@ -168,18 +199,14 @@ function cacheElements() {
   els.settingsForm = document.getElementById("settingsForm");
   els.presetManagerPanel = document.getElementById("presetManagerPanel");
   els.debateView = document.getElementById("debateView");
-  els.recordsView = document.getElementById("recordsView");
   els.landingPanel = document.getElementById("landingPanel");
   els.livePanel = document.getElementById("livePanel");
   els.reviewPanel = document.getElementById("reviewPanel");
-  els.landingNotice = document.getElementById("landingNotice");
   els.workspaceViewer = document.getElementById("workspaceViewer");
-  els.detailRecordsList = document.getElementById("detailRecordsList");
-  els.errorRecordsList = document.getElementById("errorRecordsList");
-  els.recordViewer = document.getElementById("recordViewer");
-  els.recordViewerTitle = document.getElementById("recordViewerTitle");
   els.archivedList = document.getElementById("archivedList");
-  els.deleteRecordBtn = document.getElementById("deleteRecordBtn");
+  els.appErrorToast = document.getElementById("appErrorToast");
+  els.appErrorToastMessage = document.getElementById("appErrorToastMessage");
+  els.closeAppErrorToastBtn = document.getElementById("closeAppErrorToastBtn");
   els.resultWinner = document.getElementById("resultWinner");
   els.resultScores = document.getElementById("resultScores");
   els.resultUsage = document.getElementById("resultUsage");
@@ -196,22 +223,12 @@ function bindEvents() {
   document.getElementById("closeSettingsBtn").addEventListener("click", closeSettings);
   document.getElementById("saveSettingsBtn").addEventListener("click", saveSettings);
   els.newDebateBtn.addEventListener("click", openNewDebate);
-  const recordsButton = document.getElementById("recordsBtn");
-  recordsButton?.addEventListener("click", async () => {
-    switchView("records");
-    await loadRecords();
-  });
-  document.getElementById("backToDebateBtn").addEventListener("click", () => {
-    switchView("debate");
-    renderCurrentSession();
-  });
   document.getElementById("archivedSessionsBtn").addEventListener("click", openArchivedModal);
   document.getElementById("refreshSessionsBtn").addEventListener("click", async () => {
     await Promise.all([loadSessions(), loadArchivedSessions()]);
   });
-  document.getElementById("refreshRecordsBtn").addEventListener("click", loadRecords);
   document.getElementById("closeArchivedBtn").addEventListener("click", closeArchivedModal);
-  els.deleteRecordBtn.addEventListener("click", deleteCurrentRecord);
+  els.closeAppErrorToastBtn?.addEventListener("click", clearInlineError);
   els.toggleReviewTopicBtn.addEventListener("click", toggleReviewTopicExpanded);
   els.previewErrorBtn.addEventListener("click", () => openMarkdownPreview("error"));
   els.closeMarkdownPreviewBtn.addEventListener("click", closeMarkdownPreviewModal);
@@ -228,6 +245,7 @@ function bindEvents() {
     }
   });
   els.messageDetailBody.addEventListener("click", handleMessageDetailBodyClick);
+  els.cancelDetailTextTaskBtn?.addEventListener("click", cancelMessageDetailTextTask);
   document.addEventListener("pointerdown", handleDocumentPointerDown);
   els.toggleUserTargetMenuBtn.addEventListener("click", toggleUserTargetMenu);
   els.userTargetMenuAnchor.addEventListener("pointerenter", cancelUserTargetSubmenuClose);
@@ -331,21 +349,64 @@ function bindEvents() {
     }
   });
 
-  [els.detailRecordsList, els.errorRecordsList].forEach((container) => {
-    container.addEventListener("click", async (event) => {
-      const item = event.target.closest("[data-record-kind]");
-      if (item) {
-        await openRecord(item.dataset.recordKind, item.dataset.sessionId);
-      }
-    });
-  });
-
   els.settingsForm.addEventListener("input", handleSettingsFormInput);
   els.settingsForm.addEventListener("change", handleSettingsFormChange);
   els.settingsForm.addEventListener("click", handleSettingsFormClick);
   els.presetManagerPanel.addEventListener("input", handlePresetManagerInput);
   els.presetManagerPanel.addEventListener("change", handlePresetManagerChange);
   els.presetManagerPanel.addEventListener("click", handlePresetManagerClick);
+  els.presetManagerPanel.addEventListener("dragstart", handleResponseFlowDragStart);
+  els.presetManagerPanel.addEventListener("dragover", handleResponseFlowDragOver);
+  els.presetManagerPanel.addEventListener("drop", handleResponseFlowDrop);
+  els.presetManagerPanel.addEventListener("dragend", handleResponseFlowDragEnd);
+}
+
+async function fetchWithTimeout(path, options = {}) {
+  const {
+    timeoutMs = DEFAULT_API_TIMEOUT_MS,
+    signal: externalSignal,
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId = null;
+  const abortFromExternalSignal = () => controller.abort();
+
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else if (externalSignal) {
+    externalSignal.addEventListener("abort", abortFromExternalSignal, { once: true });
+  }
+  if (Number(timeoutMs) > 0) {
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Number(timeoutMs));
+  }
+
+  try {
+    const response = await fetch(path, { ...fetchOptions, signal: controller.signal });
+    const method = String(fetchOptions.method || "GET").toUpperCase();
+    const hasNoBody = method === "HEAD" || [204, 205, 304].includes(response.status);
+    const body = hasNoBody ? null : await response.arrayBuffer();
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error(`请求超时（${Math.ceil(Number(timeoutMs) / 1000)} 秒），请检查网络或服务状态。`);
+      timeoutError.name = "TimeoutError";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+    }
+    externalSignal?.removeEventListener("abort", abortFromExternalSignal);
+  }
 }
 
 async function api(path, options = {}) {
@@ -353,7 +414,7 @@ async function api(path, options = {}) {
   if (finalOptions.body && !finalOptions.headers) {
     finalOptions.headers = { "Content-Type": "application/json" };
   }
-  const response = await fetch(path, finalOptions);
+  const response = await fetchWithTimeout(path, finalOptions);
   if (!response.ok) {
     const error = new Error(await readErrorMessage(response));
     error.status = response.status;
@@ -384,7 +445,7 @@ async function loadSettings() {
 
 async function loadNotice() {
   try {
-    const response = await fetch(`/assets/Notice.txt?ts=${Date.now()}`);
+    const response = await fetchWithTimeout(`/assets/Notice.txt?ts=${Date.now()}`, { timeoutMs: 15000 });
     if (!response.ok) {
       throw new Error("failed");
     }
@@ -402,7 +463,7 @@ async function loadNotice() {
 
 async function loadWorkspace() {
   try {
-    const response = await fetch(`/assets/workspace.md?ts=${Date.now()}`);
+    const response = await fetchWithTimeout(`/assets/workspace.md?ts=${Date.now()}`, { timeoutMs: 15000 });
     if (!response.ok) {
       throw new Error("failed");
     }
@@ -438,8 +499,9 @@ async function saveSettings() {
   try {
     const selectedPresetId = state.selectedPresetEditorId;
     await persistSettings();
+    state.settingsSnapshot = null;
     ensureSelectedPresetEditor(selectedPresetId);
-    closeSettings();
+    closeSettings({ discard: false });
   } catch (error) {
     const message = error?.message || "保存设置失败。";
     window.alert(message);
@@ -509,7 +571,31 @@ function serializeDebaterPresetSettings(preset) {
     max_tokens: Number(preset?.max_tokens || 0),
     extra_body: parseExtraBodyPayload(preset?.extra_body_input ?? preset?.extra_body, preset?.name || "辩手配置"),
     tool_selection: serializeToolSelection(preset?.tool_selection || {}),
+    response_flow: serializeResponseFlow(preset),
   };
+}
+
+function serializeResponseFlow(preset) {
+  const flow = getPresetResponseFlow(preset);
+  if (flow.mode !== "manual") {
+    return flow;
+  }
+  const selectedToolIds = new Set(getPresetToolSelection(preset).enabled_tool_ids || []);
+  flow.blocks.forEach((block) => {
+    if (block.type === "deep_thinking") {
+      const tokenLimit = Number(block.max_tokens);
+      if (!Number.isInteger(tokenLimit) || tokenLimit < RESPONSE_FLOW_MIN_THINKING_TOKENS || tokenLimit > RESPONSE_FLOW_MAX_THINKING_TOKENS) {
+        throw new Error(`深度思考 Token 数必须是 ${RESPONSE_FLOW_MIN_THINKING_TOKENS} 到 ${RESPONSE_FLOW_MAX_THINKING_TOKENS} 之间的整数。`);
+      }
+    }
+    if (block.type === "tool_call") {
+      const tool = findToolById(block.tool_id || "");
+      if (!tool || !tool.enabled || !selectedToolIds.has(tool.id)) {
+        throw new Error("人工编排中的工具调用块必须选择一个已启用、且已绑定到当前辩手的工具。");
+      }
+    }
+  });
+  return flow;
 }
 
 function serializeToolConfig(toolConfig) {
@@ -871,6 +957,47 @@ function getPresetToolSelection(preset) {
   };
 }
 
+function createResponseFlowBlock(type, options = {}) {
+  const blockId = `flow_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  if (type === "tool_call") {
+    return { id: blockId, type, tool_id: String(options.tool_id || "") };
+  }
+  return {
+    id: blockId,
+    type: "deep_thinking",
+    max_tokens: Number(options.max_tokens || 2048) || 2048,
+  };
+}
+
+function getPresetResponseFlow(preset) {
+  const raw = preset?.response_flow && typeof preset.response_flow === "object" ? preset.response_flow : {};
+  const rawBlocks = Array.isArray(raw.blocks) ? raw.blocks : [];
+  const blocks = [{ id: "flow_start", type: "start" }];
+  rawBlocks.forEach((block) => {
+    if (!block || !["deep_thinking", "tool_call"].includes(block.type) || blocks.length >= RESPONSE_FLOW_MAX_BLOCKS - 1) {
+      return;
+    }
+    if (block.type === "tool_call") {
+      blocks.push({
+        id: String(block.id || createResponseFlowBlock("tool_call").id),
+        type: "tool_call",
+        tool_id: String(block.tool_id || ""),
+      });
+      return;
+    }
+    blocks.push({
+      id: String(block.id || createResponseFlowBlock("deep_thinking").id),
+      type: "deep_thinking",
+      max_tokens: Number(block.max_tokens || 2048) || 2048,
+    });
+  });
+  blocks.push({ id: "flow_final", type: "final_response" });
+  return {
+    mode: raw.mode === "manual" ? "manual" : "autonomous",
+    blocks,
+  };
+}
+
 function getPresetSelectedTools(preset) {
   const selection = getPresetToolSelection(preset);
   return selection.enabled_tool_ids
@@ -933,11 +1060,15 @@ function createEmptyDebaterPreset() {
       max_tool_rounds: seedToolSelection.max_tool_rounds,
       fallback_enabled: seedToolSelection.fallback_enabled,
     },
+    response_flow: cloneObjectValue(getPresetResponseFlow(seed)),
   };
 }
 
 function openSettings() {
+  state.settingsSnapshot = state.settings ? cloneObjectValue(state.settings) : null;
+  state.settingsDarkModeSnapshot = state.darkMode;
   state.presetManagerOpen = false;
+  state.responseFlowEditorOpen = false;
   state.activeUtilityModelKey = "judge";
   state.utilityModelSwitcherOpen = false;
   ensurePresetManagerSelections();
@@ -960,11 +1091,20 @@ function openSettings() {
     });
 }
 
-function closeSettings() {
+function closeSettings(options = {}) {
   if (els.settingsModal.classList.contains("hidden")) {
     return;
   }
+  const shouldDiscard = options?.discard !== false;
+  if (shouldDiscard && state.settingsSnapshot) {
+    state.settings = cloneObjectValue(state.settingsSnapshot);
+    setDarkMode(state.settingsDarkModeSnapshot);
+    ensurePresetManagerSelections();
+    renderHomeDebaterBinding();
+  }
+  state.settingsSnapshot = null;
   state.presetManagerOpen = false;
+  state.responseFlowEditorOpen = false;
   renderPresetManagerPanel();
   window.clearTimeout(state.settingsModalTimer);
   els.settingsModal.classList.remove("modal-visible");
@@ -979,12 +1119,14 @@ function openPresetManager(tab = "debater") {
   state.presetManagerOpen = true;
   state.presetManagerEntering = true;
   state.presetManagerTab = normalizeConfigManagerTab(tab);
+  state.responseFlowEditorOpen = false;
   ensurePresetManagerSelections();
   renderPresetManagerPanel();
 }
 
 function closePresetManager() {
   state.presetManagerOpen = false;
+  state.responseFlowEditorOpen = false;
   renderSettingsForm({ presetManagerOptions: { preserveListScroll: false, preserveEditorScroll: false } });
 }
 
@@ -1286,11 +1428,17 @@ function describePreset(preset) {
   const toolLabel = selectedTools.length
     ? `${selectedTools.map((toolConfig) => toolConfig.name || "未命名工具").join(" / ")} · ${selection.mode || "bind_tools"} · ${selection.fallback_enabled ? "兜底开" : "兜底关"}`
     : "无工具";
-  return `${supplierLabel} · ${providerLabel} · ${modelLabel} · ${toolLabel}`;
+  const flow = getPresetResponseFlow(preset);
+  const flowLabel = flow.mode === "manual" ? `人工编排 · ${Math.max(0, flow.blocks.length - 2)} 个内部块` : "模型自主链路";
+  return `${supplierLabel} · ${providerLabel} · ${modelLabel} · ${toolLabel} · ${flowLabel}`;
 }
 
 function createPresetManagerOverlay() {
   const activeTab = normalizeConfigManagerTab(state.presetManagerTab);
+  const preset = getSelectedPreset();
+  if (state.responseFlowEditorOpen && preset) {
+    return createResponseFlowEditorOverlay(preset);
+  }
 
   return `
     <div class="preset-overlay-surface panel">
@@ -1314,6 +1462,113 @@ function createPresetManagerOverlay() {
         <div class="preset-editor-shell config-detail-shell">
           ${createConfigManagerDetail(activeTab)}
         </div>
+      </div>
+    </div>
+  `;
+}
+
+function createResponseFlowEditorOverlay(preset) {
+  const flow = getPresetResponseFlow(preset);
+  const intermediateBlocks = flow.blocks.filter((block) => !["start", "final_response"].includes(block.type));
+  const canAdd = flow.blocks.length < RESPONSE_FLOW_MAX_BLOCKS;
+  return `
+    <div class="preset-overlay-surface response-flow-overlay panel">
+      <div class="preset-overlay-head config-overlay-head">
+        <div class="preset-overlay-heading-row">
+          <div>
+            <p class="eyebrow">Manual Response Flow</p>
+            <h3>内部回复流程 · ${escapeHtml(preset.name || "未命名辩手")}</h3>
+            <p class="card-note">中间块只在本次发言内部共享上下文；对手与后续轮次只能看到“正式发言”块的输出。</p>
+          </div>
+          <div class="config-head-actions">
+            <span class="status-badge">${flow.blocks.length} / ${RESPONSE_FLOW_MAX_BLOCKS} 块</span>
+            <button class="config-tab config-tab-return" type="button" data-action="close-response-flow-editor">
+              <span>返回辩手配置</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="response-flow-editor-body">
+        <aside class="response-flow-palette">
+          <div>
+            <p class="eyebrow">Blocks</p>
+            <h4>添加内部步骤</h4>
+            <p class="card-note">拖动中间块可排序，也可以使用块右侧的上下按钮。</p>
+          </div>
+          <button class="flow-palette-button thinking" type="button" data-action="add-response-flow-block" data-flow-block-type="deep_thinking" ${canAdd ? "" : "disabled"}>
+            <span class="flow-palette-icon" aria-hidden="true">思</span>
+            <span><strong>深度思考</strong><small>独立请求一次模型，可设置 Token 上限</small></span>
+          </button>
+          <button class="flow-palette-button tool" type="button" data-action="add-response-flow-block" data-flow-block-type="tool_call" ${canAdd ? "" : "disabled"}>
+            <span class="flow-palette-icon" aria-hidden="true">搜</span>
+            <span><strong>工具调用</strong><small>强制模型生成参数并执行已绑定工具</small></span>
+          </button>
+          <div class="response-flow-privacy-note">
+            <strong>上下文隔离</strong>
+            <p>内部思考、参数与工具返回会写入详细记录，但不会进入双方公开辩论历史。</p>
+          </div>
+        </aside>
+        <div class="response-flow-scroll preset-editor-scroller">
+          <div class="response-flow-canvas" data-response-flow-dropzone>
+            ${createResponseFlowFixedBlock("start")}
+            ${intermediateBlocks.map((block, index) => createResponseFlowBlockCard(preset, block, index, intermediateBlocks.length)).join("")}
+            ${createResponseFlowFixedBlock("final_response")}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function createResponseFlowFixedBlock(type) {
+  const isStart = type === "start";
+  return `
+    <div class="response-flow-node fixed ${isStart ? "start" : "final"}" data-flow-fixed-type="${escapeAttribute(type)}">
+      <span class="flow-node-index">${isStart ? "01" : "END"}</span>
+      <div>
+        <strong>${isStart ? "开始" : "正式发言"}</strong>
+        <p>${isStart ? "载入辩题、角色任务与可见的最近辩论上下文。" : "汇总内部步骤，只把最终发言写入辩论历史。"}</p>
+      </div>
+      <span class="flow-node-lock" aria-label="固定积木">固定</span>
+    </div>
+  `;
+}
+
+function createResponseFlowBlockCard(preset, block, index, total) {
+  const isThinking = block.type === "deep_thinking";
+  const selectedTools = getPresetSelectedTools(preset).filter((tool) => tool.enabled);
+  const toolOptions = selectedTools.map((tool) => `
+    <option value="${escapeAttribute(tool.id)}" ${tool.id === block.tool_id ? "selected" : ""}>${escapeHtml(tool.name || "未命名工具")}</option>
+  `).join("");
+  return `
+    <div class="response-flow-node movable ${isThinking ? "thinking" : "tool"}" draggable="true" data-flow-block-id="${escapeAttribute(block.id)}">
+      <span class="flow-drag-handle" title="拖动排序" aria-hidden="true">⋮⋮</span>
+      <div class="flow-node-content">
+        <div class="flow-node-title-row">
+          <div>
+            <span class="flow-node-type">${isThinking ? "Deep Thinking" : "Forced Tool"}</span>
+            <strong>${isThinking ? "深度思考" : "工具调用"}</strong>
+          </div>
+          <div class="flow-node-actions">
+            <button type="button" data-action="move-response-flow-block" data-flow-block-id="${escapeAttribute(block.id)}" data-flow-direction="up" aria-label="上移" ${index === 0 ? "disabled" : ""}>↑</button>
+            <button type="button" data-action="move-response-flow-block" data-flow-block-id="${escapeAttribute(block.id)}" data-flow-direction="down" aria-label="下移" ${index === total - 1 ? "disabled" : ""}>↓</button>
+            <button class="danger" type="button" data-action="remove-response-flow-block" data-flow-block-id="${escapeAttribute(block.id)}" aria-label="删除积木">×</button>
+          </div>
+        </div>
+        ${isThinking ? `
+          <label class="flow-node-field">
+            <span>本次请求 Token 上限</span>
+            <input type="number" min="${RESPONSE_FLOW_MIN_THINKING_TOKENS}" max="${RESPONSE_FLOW_MAX_THINKING_TOKENS}" step="128" value="${escapeAttribute(block.max_tokens || 2048)}" data-flow-block-id="${escapeAttribute(block.id)}" data-flow-block-field="max_tokens" />
+          </label>
+        ` : `
+          <label class="flow-node-field">
+            <span>强制调用工具</span>
+            <select data-flow-block-id="${escapeAttribute(block.id)}" data-flow-block-field="tool_id">
+              <option value="">${selectedTools.length ? "请选择工具" : "请先在辩手配置中绑定并启用工具"}</option>
+              ${toolOptions}
+            </select>
+          </label>
+        `}
       </div>
     </div>
   `;
@@ -1708,11 +1963,42 @@ function createPresetEditor(preset) {
           <span>Max Tokens</span>
           <input data-preset-field="max_tokens" type="number" min="1" value="${escapeAttribute(preset.max_tokens || 8000)}" />
         </label>
+        ${createResponseFlowSettings(preset)}
         ${createPresetToolSelector(selection)}
       </div>
       <div class="preset-editor-actions">
         <button class="danger-button compact-button" type="button" data-action="delete-preset" ${deleteDisabled ? "disabled" : ""}>删除当前配置</button>
       </div>
+    </div>
+  `;
+}
+
+function createResponseFlowSettings(preset) {
+  const flow = getPresetResponseFlow(preset);
+  const intermediateCount = Math.max(0, flow.blocks.length - 2);
+  return `
+    <div class="search-section response-flow-settings">
+      <div class="toggle-row response-flow-mode-row">
+        <div>
+          <strong>内部回复链路</strong>
+          <p class="card-note">自主链路沿用当前 bind_tools / react 流程；人工编排按固定积木顺序执行。</p>
+        </div>
+        <span class="status-badge">${flow.mode === "manual" ? `${intermediateCount} 个内部块` : "自主"}</span>
+      </div>
+      <div class="response-flow-mode-grid">
+        <label class="response-flow-mode-option ${flow.mode === "autonomous" ? "active" : ""}">
+          <input type="radio" name="response-flow-mode-${escapeAttribute(preset.id)}" value="autonomous" data-preset-flow-field="mode" ${flow.mode === "autonomous" ? "checked" : ""} />
+          <span><strong>模型自主工具链路</strong><small>模型自行判断是否调用工具，并使用当前工具模式。</small></span>
+        </label>
+        <label class="response-flow-mode-option ${flow.mode === "manual" ? "active" : ""}">
+          <input type="radio" name="response-flow-mode-${escapeAttribute(preset.id)}" value="manual" data-preset-flow-field="mode" ${flow.mode === "manual" ? "checked" : ""} />
+          <span><strong>人工编排链路</strong><small>按纵向积木依次思考、调用工具并生成正式发言。</small></span>
+        </label>
+      </div>
+      <button class="primary-button response-flow-editor-button" type="button" data-action="open-response-flow-editor" ${flow.mode === "manual" ? "" : "disabled"}>
+        <span>打开积木流程编辑器</span>
+        <small>${flow.blocks.length} / ${RESPONSE_FLOW_MAX_BLOCKS} 块</small>
+      </button>
     </div>
   `;
 }
@@ -1887,6 +2173,8 @@ function handlePresetManagerChange(event) {
     || event.target.dataset.presetToolField
     || event.target.dataset.supplierField
     || event.target.dataset.toolConfigField
+    || event.target.dataset.presetFlowField
+    || event.target.dataset.flowBlockField
     || "";
   if (shouldRerender || ["name", "model", "supplier_id", "provider", "mode", "enabled"].includes(field)) {
     renderSettingsForm();
@@ -1905,6 +2193,7 @@ function handlePresetManagerClick(event) {
     return;
   }
   if (action === "switch-config-tab") {
+    state.responseFlowEditorOpen = false;
     state.presetManagerTab = normalizeConfigManagerTab(actionTarget.dataset.configTab || "");
     ensurePresetManagerSelections();
     renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: false });
@@ -1919,6 +2208,7 @@ function handlePresetManagerClick(event) {
     return;
   }
   if (action === "select-preset") {
+    state.responseFlowEditorOpen = false;
     state.selectedPresetEditorId = actionTarget.dataset.presetId || "";
     state.presetManagerTab = "debater";
     renderPresetManagerPanel({ preserveListScroll: true, preserveEditorScroll: false });
@@ -1945,6 +2235,34 @@ function handlePresetManagerClick(event) {
       };
       renderPresetManagerPanel({ preserveListScroll: true, preserveEditorScroll: true });
     }
+    return;
+  }
+  if (action === "open-response-flow-editor") {
+    const preset = getSelectedPreset();
+    if (!preset) {
+      return;
+    }
+    preset.response_flow = getPresetResponseFlow(preset);
+    preset.response_flow.mode = "manual";
+    state.responseFlowEditorOpen = true;
+    renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: false });
+    return;
+  }
+  if (action === "close-response-flow-editor") {
+    state.responseFlowEditorOpen = false;
+    renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: false });
+    return;
+  }
+  if (action === "add-response-flow-block") {
+    addResponseFlowBlock(actionTarget.dataset.flowBlockType || "deep_thinking");
+    return;
+  }
+  if (action === "remove-response-flow-block") {
+    removeResponseFlowBlock(actionTarget.dataset.flowBlockId || "");
+    return;
+  }
+  if (action === "move-response-flow-block") {
+    moveResponseFlowBlock(actionTarget.dataset.flowBlockId || "", actionTarget.dataset.flowDirection || "up");
     return;
   }
   if (action === "delete-preset") {
@@ -2037,6 +2355,23 @@ function applySettingsInput(target) {
     return false;
   }
 
+  const presetFlowField = target.dataset.presetFlowField;
+  if (presetFlowField) {
+    preset.response_flow = getPresetResponseFlow(preset);
+    preset.response_flow[presetFlowField] = readFieldValue(target);
+    return presetFlowField === "mode";
+  }
+
+  const flowBlockField = target.dataset.flowBlockField;
+  if (flowBlockField) {
+    preset.response_flow = getPresetResponseFlow(preset);
+    const block = preset.response_flow.blocks.find((item) => item.id === target.dataset.flowBlockId);
+    if (block) {
+      block[flowBlockField] = readFieldValue(target);
+    }
+    return false;
+  }
+
   const presetField = target.dataset.presetField;
   if (presetField) {
     if (presetField === "extra_body") {
@@ -2068,6 +2403,99 @@ function applySettingsInput(target) {
   }
 
   return false;
+}
+
+function addResponseFlowBlock(type) {
+  const preset = getSelectedPreset();
+  if (!preset) {
+    return;
+  }
+  const flow = getPresetResponseFlow(preset);
+  if (flow.blocks.length >= RESPONSE_FLOW_MAX_BLOCKS) {
+    window.alert(`内部回复流程最多只能包含 ${RESPONSE_FLOW_MAX_BLOCKS} 个积木。`);
+    return;
+  }
+  const selectedTool = getPresetSelectedTools(preset).find((tool) => tool.enabled);
+  const block = createResponseFlowBlock(type === "tool_call" ? "tool_call" : "deep_thinking", {
+    tool_id: selectedTool?.id || "",
+  });
+  flow.blocks.splice(flow.blocks.length - 1, 0, block);
+  flow.mode = "manual";
+  preset.response_flow = flow;
+  renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: true });
+}
+
+function removeResponseFlowBlock(blockId) {
+  const preset = getSelectedPreset();
+  if (!preset || !blockId) {
+    return;
+  }
+  const flow = getPresetResponseFlow(preset);
+  flow.blocks = flow.blocks.filter((block) => block.id !== blockId || ["start", "final_response"].includes(block.type));
+  preset.response_flow = flow;
+  renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: true });
+}
+
+function moveResponseFlowBlock(blockId, direction, targetId = "", placeAfter = false) {
+  const preset = getSelectedPreset();
+  if (!preset || !blockId) {
+    return;
+  }
+  const flow = getPresetResponseFlow(preset);
+  const intermediates = flow.blocks.filter((block) => !["start", "final_response"].includes(block.type));
+  const sourceIndex = intermediates.findIndex((block) => block.id === blockId);
+  if (sourceIndex < 0) {
+    return;
+  }
+  const [source] = intermediates.splice(sourceIndex, 1);
+  let nextIndex;
+  if (targetId) {
+    const targetIndex = intermediates.findIndex((block) => block.id === targetId);
+    nextIndex = targetIndex < 0 ? intermediates.length : targetIndex + (placeAfter ? 1 : 0);
+  } else {
+    nextIndex = direction === "down" ? sourceIndex + 1 : sourceIndex - 1;
+  }
+  intermediates.splice(Math.max(0, Math.min(nextIndex, intermediates.length)), 0, source);
+  flow.blocks = [{ id: "flow_start", type: "start" }, ...intermediates, { id: "flow_final", type: "final_response" }];
+  preset.response_flow = flow;
+  renderPresetManagerPanel({ preserveListScroll: false, preserveEditorScroll: true });
+}
+
+function handleResponseFlowDragStart(event) {
+  const block = event.target.closest?.("[data-flow-block-id][draggable='true']");
+  if (!block) {
+    return;
+  }
+  state.responseFlowDraggingBlockId = block.dataset.flowBlockId || "";
+  block.classList.add("dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", state.responseFlowDraggingBlockId);
+}
+
+function handleResponseFlowDragOver(event) {
+  const target = event.target.closest?.("[data-flow-block-id][draggable='true']");
+  if (!target || !state.responseFlowDraggingBlockId || target.dataset.flowBlockId === state.responseFlowDraggingBlockId) {
+    return;
+  }
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+}
+
+function handleResponseFlowDrop(event) {
+  const target = event.target.closest?.("[data-flow-block-id][draggable='true']");
+  const sourceId = state.responseFlowDraggingBlockId || event.dataTransfer.getData("text/plain");
+  if (!target || !sourceId || target.dataset.flowBlockId === sourceId) {
+    return;
+  }
+  event.preventDefault();
+  const rect = target.getBoundingClientRect();
+  moveResponseFlowBlock(sourceId, "", target.dataset.flowBlockId || "", event.clientY > rect.top + rect.height / 2);
+  state.responseFlowDraggingBlockId = "";
+}
+
+function handleResponseFlowDragEnd(event) {
+  event.target.closest?.("[data-flow-block-id][draggable='true']")?.classList.remove("dragging");
+  state.responseFlowDraggingBlockId = "";
 }
 
 function readFieldValue(target) {
@@ -2176,6 +2604,9 @@ function deleteToolConfig(toolId) {
       ...selection,
       enabled_tool_ids: selection.enabled_tool_ids.filter((item) => item !== toolConfig.id),
     };
+    const flow = getPresetResponseFlow(preset);
+    flow.blocks = flow.blocks.filter((block) => block.type !== "tool_call" || block.tool_id !== toolConfig.id);
+    preset.response_flow = flow;
   });
   renderSettingsForm({ presetManagerOptions: { preserveListScroll: false, preserveEditorScroll: false } });
 }
@@ -2231,10 +2662,26 @@ function deleteSelectedPreset() {
   renderSettingsForm({ presetManagerOptions: { preserveListScroll: false, preserveEditorScroll: false } });
 }
 async function loadSessions() {
-  state.sessions = await api("/api/debates");
+  const requestId = ++state.sessionListRequestId;
+  const sessions = await api("/api/debates");
+  if (requestId !== state.sessionListRequestId) {
+    return false;
+  }
+  state.sessions = sessions;
   syncCurrentSessionSummary();
   renderSessions();
   scheduleSessionSummaryRefresh();
+  return true;
+}
+
+function scheduleSessionListRefresh(delay = SESSION_LIST_REFRESH_DEBOUNCE_MS) {
+  window.clearTimeout(state.sessionListRefreshTimer);
+  state.sessionListRefreshTimer = window.setTimeout(() => {
+    state.sessionListRefreshTimer = null;
+    void loadSessions().catch(() => {
+      // 实时消息已经更新当前界面，列表刷新失败留待下一轮重试。
+    });
+  }, Math.max(0, Number(delay) || 0));
 }
 
 function getSessionDisplayTitle(session, fallbackTitle = "", options = {}) {
@@ -2333,9 +2780,7 @@ async function refreshSessionSummaries() {
   }
   state.sessionSummaryRefreshInFlight = true;
   try {
-    state.sessions = await api("/api/debates");
-    syncCurrentSessionSummary();
-    renderSessions();
+    await loadSessions();
   } catch {
     // 背景摘要刷新失败时直接等待下一轮，不打断当前界面。
   } finally {
@@ -2480,6 +2925,7 @@ async function startDebate(event) {
 
   try {
     clearInlineError();
+    cancelSessionOpenRequest();
     disconnectStream();
     setRunningState(true, "正在创建会话...");
     const session = await api("/api/debates", {
@@ -2508,19 +2954,21 @@ async function startDebate(event) {
   }
 }
 
-async function fetchSessionIntoState(sessionId) {
-  const session = await api(`/api/debates/${sessionId}`);
+function cancelSessionOpenRequest() {
+  state.sessionOpenRequestId += 1;
+  state.sessionOpenController?.abort();
+  state.sessionOpenController = null;
+}
+
+async function fetchSession(sessionId, options = {}) {
+  const session = await api(`/api/debates/${sessionId}`, { signal: options.signal });
   if (session?.status === "error") {
-    await hydrateErrorDetails(session);
+    await hydrateErrorDetails(session, options);
   }
-  state.currentSession = session;
-  state.currentSessionId = session.id;
-  state.typing = isRunningSessionStatus(session?.status) ? session.live_status || null : null;
-  clearInlineError();
   return session;
 }
 
-async function hydrateErrorDetails(session) {
+async function hydrateErrorDetails(session, options = {}) {
   if (!session || session.status !== "error") {
     return session;
   }
@@ -2528,7 +2976,7 @@ async function hydrateErrorDetails(session) {
     return session;
   }
   try {
-    const record = await api(`/api/records/error/${session.id}`);
+    const record = await api(`/api/records/error/${session.id}`, { signal: options.signal });
     const parsed = parseErrorRecord(record.content || "");
     if (!session.error_message && parsed.errorMessage) {
       session.error_message = parsed.errorMessage;
@@ -2536,16 +2984,30 @@ async function hydrateErrorDetails(session) {
     if (!session.error_traceback && parsed.traceback) {
       session.error_traceback = parsed.traceback;
     }
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     // 旧会话可能没有单独的错误记录，直接保持现状即可。
   }
   return session;
 }
 
 async function openSession(sessionId, shouldConnect, switchToDebate = true) {
+  state.sessionOpenController?.abort();
+  const controller = new AbortController();
+  const requestId = ++state.sessionOpenRequestId;
+  state.sessionOpenController = controller;
   try {
     closeTitleEditModal({ immediate: true });
-    const session = await fetchSessionIntoState(sessionId);
+    const session = await fetchSession(sessionId, { signal: controller.signal });
+    if (requestId !== state.sessionOpenRequestId) {
+      return;
+    }
+    state.currentSession = session;
+    state.currentSessionId = session.id;
+    state.typing = isRunningSessionStatus(session?.status) ? session.live_status || null : null;
+    clearInlineError();
     state.reviewTopicExpanded = false;
     state.expandedEvaluationGroups = {};
     resetUserTargetState({ clearSelection: true });
@@ -2560,7 +3022,14 @@ async function openSession(sessionId, shouldConnect, switchToDebate = true) {
     }
     await Promise.all([loadSessions(), loadArchivedSessions()]);
   } catch (error) {
+    if (isAbortError(error) || requestId !== state.sessionOpenRequestId) {
+      return;
+    }
     showLocalError(error.message);
+  } finally {
+    if (requestId === state.sessionOpenRequestId) {
+      state.sessionOpenController = null;
+    }
   }
 }
 
@@ -2592,7 +3061,7 @@ async function archiveSession(sessionId) {
     if (state.currentSessionId === sessionId && state.currentSession) {
       state.currentSession = session;
     }
-    await Promise.all([loadSessions(), loadArchivedSessions(), loadRecords()]);
+    await Promise.all([loadSessions(), loadArchivedSessions()]);
     renderCurrentSession();
   } catch (error) {
     showLocalError(error.message);
@@ -2605,7 +3074,7 @@ async function restoreArchivedSession(sessionId) {
     if (state.currentSessionId === sessionId && state.currentSession) {
       state.currentSession = session;
     }
-    await Promise.all([loadSessions(), loadArchivedSessions(), loadRecords()]);
+    await Promise.all([loadSessions(), loadArchivedSessions()]);
     renderCurrentSession();
   } catch (error) {
     showLocalError(error.message);
@@ -2627,7 +3096,7 @@ async function deleteSession(sessionId, options = {}) {
       clearInlineError();
       renderCurrentSession();
     }
-    const tasks = [loadSessions(), loadRecords()];
+    const tasks = [loadSessions()];
     if (options.reloadArchived) {
       tasks.push(loadArchivedSessions());
     }
@@ -2651,7 +3120,20 @@ function connectStream(sessionId, options = {}) {
     clearStreamReconnectTimer();
   };
   source.onmessage = async (event) => {
-    const payload = JSON.parse(event.data);
+    if (state.eventSource !== source || state.eventSourceSessionId !== sessionId) {
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      showLocalError("收到无法解析的实时事件，连接将继续保持。", true);
+      return;
+    }
+    const payloadSessionId = payload.session_id || payload.session?.id || "";
+    if (payloadSessionId && payloadSessionId !== sessionId) {
+      return;
+    }
     await handleStreamEvent(payload);
   };
   source.onerror = () => {
@@ -2731,7 +3213,7 @@ async function handleStreamEvent(payload) {
       setRunningState(false, "运行出错");
     }
     renderCurrentSession();
-    void Promise.all([loadSessions(), loadRecords()]);
+    scheduleSessionListRefresh(payload.type === "error" ? 0 : SESSION_LIST_REFRESH_DEBOUNCE_MS);
     return;
   }
 
@@ -2869,7 +3351,7 @@ async function handleMessageRewindAction(messageId) {
     resetUserTargetState({ clearSelection: true });
     switchView("debate");
     renderCurrentSession();
-    await Promise.all([loadSessions(), loadArchivedSessions(), loadRecords()]);
+    await Promise.all([loadSessions(), loadArchivedSessions()]);
   } catch (error) {
     showLocalError(error.message);
   } finally {
@@ -3269,6 +3751,7 @@ async function submitTitleEdit() {
 }
 
 function openNewDebate() {
+  cancelSessionOpenRequest();
   disconnectStream();
   closeTitleEditModal({ immediate: true });
   state.currentSession = null;
@@ -3329,7 +3812,7 @@ async function stopCurrentDebate() {
     }
     switchView("debate");
     renderCurrentSession();
-    await Promise.all([loadSessions(), loadRecords()]);
+    await loadSessions();
   } catch (error) {
     showLocalError(error.message);
   } finally {
@@ -3422,13 +3905,7 @@ function renderLandingState() {
   state.sendingUserMessageSessionId = "";
   state.retractingUserMessageSessionId = "";
   renderWorkspace();
-  if (state.inlineError) {
-    els.landingNotice.textContent = state.inlineError;
-    els.landingNotice.classList.remove("hidden");
-  } else {
-    els.landingNotice.textContent = "";
-    els.landingNotice.classList.add("hidden");
-  }
+  renderInlineErrorToast();
 }
 
 function renderWorkspace() {
@@ -3959,26 +4436,6 @@ function renderTypingRow(status, session, options = {}) {
   `;
 }
 
-async function loadRecords() {
-  const records = await api("/api/records");
-  state.records = {
-    detail: (records.detail || []).map((item) => ({
-      ...item,
-      display_title: getRecordDisplayTitle(item),
-    })),
-    error: (records.error || []).map((item) => ({
-      ...item,
-      display_title: getRecordDisplayTitle(item),
-    })),
-  };
-  renderRecordLists();
-}
-
-function renderRecordLists() {
-  renderOneRecordList(els.detailRecordsList, state.records.detail, "detail");
-  renderOneRecordList(els.errorRecordsList, state.records.error, "error");
-}
-
 function getRecordDisplayTitle(record) {
   const explicitTitle = String(record?.display_title || record?.displayTitle || "").trim();
   if (explicitTitle) {
@@ -4002,14 +4459,6 @@ function getRecordDisplayTitle(record) {
   return String(record?.topic || "").trim();
 }
 
-function getRecordViewerHeadline(record) {
-  if (!record) {
-    return "记录查看";
-  }
-  const prefix = record.kind === "error" ? "错误" : "详情";
-  return `${prefix}·${getRecordDisplayTitle(record) || "记录查看"}`;
-}
-
 function normalizeRecordContent(record) {
   const content = String(record?.content || "");
   const displayTitle = getRecordDisplayTitle(record);
@@ -4022,90 +4471,11 @@ function normalizeRecordContent(record) {
     .replace(/^- 辩题：.*$/m, `- 标题：${displayTitle}`);
 }
 
-function renderOneRecordList(container, items, kind) {
-  if (!items.length) {
-    container.innerHTML = '<div class="empty-state">这里暂时还没有记录。</div>';
-    return;
-  }
-
-  container.innerHTML = items
-    .map((item) => {
-      const active = state.currentRecord?.kind === kind && state.currentRecord?.sessionId === item.session_id ? "active" : "";
-      const meta = `${formatStatus(item.status)} · ${formatDate(item.created_at)}`;
-      const displayTitle = getRecordDisplayTitle(item);
-      return `
-        <div class="record-item ${active}" data-record-kind="${kind}" data-session-id="${item.session_id}">
-          <div title="${escapeAttribute(displayTitle)}">
-            <p class="record-title" title="${escapeAttribute(displayTitle)}">${escapeHtml(displayTitle)}</p>
-            <div class="record-meta" title="${escapeAttribute(meta)}">${escapeHtml(meta)}</div>
-          </div>
-        </div>
-      `;
-    })
-    .join("");
-}
-
-async function openRecord(kind, sessionId) {
-  try {
-    const record = await api(`/api/records/${kind}/${sessionId}`);
-    state.currentRecord = {
-      kind,
-      sessionId,
-      topic: record.topic,
-      displayTitle: getRecordDisplayTitle({ ...record, kind, sessionId }),
-    };
-    els.recordViewerTitle.textContent = getRecordViewerHeadline(state.currentRecord);
-    setHeadline(getRecordViewerHeadline(state.currentRecord));
-    els.recordViewer.classList.remove("empty-viewer");
-    els.recordViewer.innerHTML = renderMarkdown(normalizeRecordContent({ ...record, kind, sessionId, displayTitle: state.currentRecord.displayTitle }));
-    els.recordViewer.scrollTop = 0;
-    els.recordViewer.scrollLeft = 0;
-    els.deleteRecordBtn.disabled = false;
-    renderRecordLists();
-  } catch (error) {
-    showLocalError(error.message);
-  }
-}
-
-async function deleteCurrentRecord() {
-  if (!state.currentRecord) {
-    return;
-  }
-  const yes = window.confirm("确认删除当前记录吗？");
-  if (!yes) {
-    return;
-  }
-
-  try {
-    await api(`/api/records/${state.currentRecord.kind}/${state.currentRecord.sessionId}`, { method: "DELETE" });
-    state.currentRecord = null;
-    els.recordViewerTitle.textContent = "选择一份记录";
-    if (state.currentView === "records") {
-      setHeadline("记录查看");
-    }
-    els.recordViewer.classList.add("empty-viewer");
-    els.recordViewer.textContent = "选择左侧记录后，会在这里以只读 Markdown 方式展示。";
-    els.deleteRecordBtn.disabled = true;
-    await loadRecords();
-  } catch (error) {
-    showLocalError(error.message);
-  }
-}
-
-function switchView(view) {
-  if (view !== "debate") {
-    closeTitleEditModal({ immediate: true });
-  }
-  const showDebate = view === "debate";
-  els.debateView.classList.toggle("view-active", showDebate);
-  els.recordsView.classList.toggle("view-active", !showDebate);
+function switchView() {
+  els.debateView.classList.add("view-active");
   state.reviewTopicExpanded = false;
   resetUserTargetState();
   state.expandedEvaluationGroups = {};
-  state.currentView = view;
-  if (view === "records") {
-    setHeadline(state.currentRecord ? getRecordViewerHeadline(state.currentRecord) : "记录查看");
-  }
 }
 
 function setRunningState(isRunning, text) {
@@ -4120,7 +4490,7 @@ function setExportButtonsEnabled(enabled) {
 }
 
 function getExportSessionId() {
-  return state.currentSession?.id || state.currentSessionId || state.currentRecord?.sessionId || "";
+  return state.currentSession?.id || state.currentSessionId || "";
 }
 
 function parseDownloadFilename(disposition) {
@@ -4137,8 +4507,11 @@ function parseDownloadFilename(disposition) {
   return plainMatch ? plainMatch[1] : "";
 }
 
-async function fetchSessionExportMarkdown(sessionId, kind) {
-  const response = await fetch(`/api/debates/${encodeURIComponent(sessionId)}/export/${encodeURIComponent(kind)}`);
+async function fetchSessionExportMarkdown(sessionId, kind, options = {}) {
+  const response = await fetchWithTimeout(`/api/debates/${encodeURIComponent(sessionId)}/export/${encodeURIComponent(kind)}`, {
+    signal: options.signal,
+    timeoutMs: EXPORT_API_TIMEOUT_MS,
+  });
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -4147,19 +4520,25 @@ async function fetchSessionExportMarkdown(sessionId, kind) {
   return { content, fileName };
 }
 
-async function fetchErrorRecordMarkdown(session) {
+async function fetchErrorRecordMarkdown(session, options = {}) {
   const sessionId = session?.id || getExportSessionId();
   if (!sessionId) {
     throw new Error("请先选择一条可预览的辩论记录。");
   }
   try {
-    const record = await api(`/api/records/error/${encodeURIComponent(sessionId)}`);
+    const record = await api(`/api/records/error/${encodeURIComponent(sessionId)}`, {
+      signal: options.signal,
+      timeoutMs: EXPORT_API_TIMEOUT_MS,
+    });
     const displayTitle = getRecordDisplayTitle({ ...record, kind: "error", sessionId });
     return {
       content: normalizeRecordContent({ ...record, kind: "error", sessionId, displayTitle }),
       fileName: `${sessionId}-error.md`,
     };
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     if (error?.status && error.status !== 404) {
       throw error;
     }
@@ -4209,11 +4588,11 @@ function getMarkdownPreviewMeta(kind) {
   return { eyebrow: "Markdown Preview", title: "记录预览" };
 }
 
-function showMarkdownPreviewShell(kind) {
+function showMarkdownPreviewShell(kind, sessionId) {
   const meta = getMarkdownPreviewMeta(kind);
   state.markdownPreview = {
     kind,
-    sessionId: getExportSessionId(),
+    sessionId,
     content: "",
     fileName: "",
   };
@@ -4234,11 +4613,19 @@ async function openMarkdownPreview(kind) {
     return;
   }
 
-  showMarkdownPreviewShell(kind);
+  state.markdownPreviewController?.abort();
+  const controller = new AbortController();
+  const requestId = ++state.markdownPreviewRequestId;
+  const session = state.currentSession;
+  state.markdownPreviewController = controller;
+  showMarkdownPreviewShell(kind, sessionId);
   try {
     const payload = kind === "error"
-      ? await fetchErrorRecordMarkdown(state.currentSession)
-      : await fetchSessionExportMarkdown(sessionId, kind);
+      ? await fetchErrorRecordMarkdown(session, { signal: controller.signal })
+      : await fetchSessionExportMarkdown(sessionId, kind, { signal: controller.signal });
+    if (requestId !== state.markdownPreviewRequestId) {
+      return;
+    }
     state.markdownPreview = {
       kind,
       sessionId,
@@ -4251,15 +4638,27 @@ async function openMarkdownPreview(kind) {
     els.markdownPreviewViewer.scrollLeft = 0;
     els.downloadMarkdownPreviewBtn.disabled = !payload.content;
   } catch (error) {
+    if (isAbortError(error) || requestId !== state.markdownPreviewRequestId) {
+      return;
+    }
     state.markdownPreview = null;
     els.markdownPreviewViewer.classList.add("empty-viewer");
     els.markdownPreviewViewer.textContent = error.message || "读取 Markdown 记录失败。";
     els.downloadMarkdownPreviewBtn.disabled = true;
     showLocalError(error.message, true);
+  } finally {
+    if (requestId === state.markdownPreviewRequestId) {
+      state.markdownPreviewController = null;
+    }
   }
 }
 
 function closeMarkdownPreviewModal({ immediate = false } = {}) {
+  state.markdownPreviewRequestId += 1;
+  state.markdownPreviewController?.abort();
+  state.markdownPreviewController = null;
+  state.markdownPreview = null;
+  els.downloadMarkdownPreviewBtn.disabled = true;
   window.clearTimeout(state.markdownPreviewModalTimer);
   if (immediate) {
     els.markdownPreviewModal.classList.add("hidden");
@@ -4686,11 +5085,60 @@ function rerenderMessageDetailBody({ preserveScroll = true } = {}) {
   els.messageDetailBody.scrollTop = scrollTop;
 }
 
+function renderDetailTextTaskBar() {
+  if (!els.detailTextTaskBar || !els.detailTextTaskLabel) {
+    return;
+  }
+  const task = state.messageDetailTask;
+  if (!task) {
+    els.detailTextTaskBar.classList.add("hidden");
+    els.detailTextTaskBar.classList.remove("visible");
+    els.detailTextTaskLabel.textContent = "";
+    return;
+  }
+  els.detailTextTaskLabel.textContent = task.label || "正在处理模型调用细节...";
+  els.detailTextTaskBar.classList.remove("hidden");
+  window.requestAnimationFrame(() => {
+    if (state.messageDetailTask === task) {
+      els.detailTextTaskBar.classList.add("visible");
+    }
+  });
+}
+
+function clearMessageDetailTextTask(task) {
+  if (task && state.messageDetailTask && state.messageDetailTask !== task) {
+    return;
+  }
+  state.messageDetailTask = null;
+  state.messageDetailLoadingKey = "";
+  renderDetailTextTaskBar();
+}
+
+function cancelMessageDetailTextTask() {
+  const task = state.messageDetailTask;
+  if (!task) {
+    return;
+  }
+  task.cancelled = true;
+  task.controller?.abort();
+  if (task.target) {
+    setActiveDetailTextView(task.target, "original");
+  }
+  clearMessageDetailTextTask(task);
+  rerenderMessageDetailBody();
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError";
+}
+
 async function handleMessageDetailBodyClick(event) {
   const action = event.target.closest("[data-action='message-detail-text-view']");
   if (!action || !state.messageDetail?.messageId || !state.currentSession?.id) {
     return;
   }
+  const sessionId = state.currentSession.id;
+  const messageId = state.messageDetail.messageId;
   const target = parseDetailTextViewTarget(action);
   if (!Number.isInteger(target.detailIndex) || (target.contentKind === "reasoning" && !Number.isInteger(target.entryIndex))) {
     showLocalError("无法定位这段调用细节文本。", true);
@@ -4710,19 +5158,33 @@ async function handleMessageDetailBodyClick(event) {
   }
 
   const loadingKey = `${getDetailTargetKey(target)}:${target.view}`;
-  if (state.messageDetailLoadingKey) {
+  if (state.messageDetailTask) {
+    renderDetailTextTaskBar();
     return;
   }
+  const controller = new AbortController();
+  const task = {
+    key: loadingKey,
+    view: target.view,
+    target,
+    label: target.view === "translation" ? "正在翻译模型调用细节..." : "正在总结模型调用细节...",
+    controller,
+    cancelled: false,
+  };
+  state.messageDetailTask = task;
   state.messageDetailLoadingKey = loadingKey;
   setActiveDetailTextView(target, target.view);
+  renderDetailTextTaskBar();
   rerenderMessageDetailBody();
 
   try {
-    const result = await api(`/api/debates/${state.currentSession.id}/message-detail-view`, {
+    const result = await api(`/api/debates/${sessionId}/message-detail-view`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      timeoutMs: MODEL_TASK_API_TIMEOUT_MS,
       body: JSON.stringify({
-        message_id: state.messageDetail.messageId,
+        message_id: messageId,
         detail_index: target.detailIndex,
         content_kind: target.contentKind,
         entry_index: target.entryIndex,
@@ -4730,15 +5192,20 @@ async function handleMessageDetailBodyClick(event) {
       }),
     });
     if (result?.session) {
-      state.currentSession = result.session;
+      if (state.currentSession?.id === sessionId) {
+        state.currentSession = result.session;
+      }
       upsertSessionSummary(result.session);
       renderSessions();
     }
   } catch (error) {
+    if (isAbortError(error) || task.cancelled) {
+      return;
+    }
     setActiveDetailTextView(target, "original");
     showLocalError(error?.message || "生成内容失败，请检查翻译/总结模型配置。", true);
   } finally {
-    state.messageDetailLoadingKey = "";
+    clearMessageDetailTextTask(task);
     rerenderMessageDetailBody();
   }
 }
@@ -4765,7 +5232,6 @@ function openMessageDetails(messageId) {
 
 function closeMessageDetailModal({ immediate = false } = {}) {
   window.clearTimeout(state.messageDetailModalTimer);
-  state.messageDetailLoadingKey = "";
   state.messageDetail = null;
   if (immediate) {
     els.messageDetailModal.classList.add("hidden");
@@ -4796,34 +5262,28 @@ async function downloadSessionExport(kind) {
 }
 function clearInlineError() {
   state.inlineError = "";
+  renderInlineErrorToast();
 }
 
 function showLocalError(message, ephemeral = false) {
-  const isLiveSession = state.currentSession && isLiveSessionStatus(state.currentSession.status);
-  if (!isLiveSession) {
-    state.inlineError = message;
-    renderCurrentSession();
-    if (ephemeral) {
-      setTimeout(() => {
-        if (state.inlineError === message) {
-          clearInlineError();
-          renderCurrentSession();
-        }
-      }, 3600);
-    }
+  const normalizedMessage = String(message || "发生未知错误，请检查服务日志。");
+  state.inlineError = normalizedMessage;
+  renderInlineErrorToast();
+  if (ephemeral) {
+    window.setTimeout(() => {
+      if (state.inlineError === normalizedMessage) {
+        clearInlineError();
+      }
+    }, 3600);
+  }
+}
+
+function renderInlineErrorToast() {
+  if (!els.appErrorToast || !els.appErrorToastMessage) {
     return;
   }
-
-  const errorMessage = {
-    id: `local-${Date.now()}`,
-    type: "error",
-    role: "system",
-    label: "系统",
-    content: message,
-    timestamp: new Date().toISOString(),
-  };
-  upsertMessage(errorMessage);
-  renderCurrentSession();
+  els.appErrorToastMessage.textContent = state.inlineError;
+  els.appErrorToast.classList.toggle("hidden", !state.inlineError);
 }
 
 function parseErrorRecord(markdown) {

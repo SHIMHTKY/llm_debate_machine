@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Debate Studio</title>
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=20260326-favicon" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260704-detail-text-actions-4" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260821-runtime-integrity-1" />
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -63,7 +63,6 @@
                   </div>
                   <span id="runStatusBadge" class="status-badge">空闲中</span>
                 </div>
-                <div id="landingNotice" class="inline-notice hidden"></div>
                 <form id="debateForm" class="debate-form" onsubmit="return false">
                   <label>
                     <span>辩题</span>
@@ -200,51 +199,6 @@
           </section>
         </section>
 
-        <section id="recordsView" class="view">
-          <div class="records-layout">
-            <section class="panel records-panel">
-              <div class="panel-head">
-                <div>
-                  <p class="eyebrow">Detail</p>
-                  <h3>详情记录</h3>
-                </div>
-                <button id="backToDebateBtn" class="ghost-button" type="button">返回辩论</button>
-              </div>
-              <div id="detailRecordsList" class="record-list"></div>
-            </section>
-
-            <section class="panel records-panel">
-              <div class="panel-head">
-                <div>
-                  <p class="eyebrow">Error</p>
-                  <h3>错误日志</h3>
-                </div>
-                <button id="refreshRecordsBtn" class="ghost-button" type="button">刷新</button>
-              </div>
-              <div id="errorRecordsList" class="record-list"></div>
-            </section>
-
-            <section class="panel viewer-panel">
-              <div class="panel-head viewer-head">
-                <div class="viewer-head-copy">
-                  <p class="eyebrow">Markdown</p>
-                  <h3 id="recordViewerTitle">选择一份记录</h3>
-                </div>
-                <button id="deleteRecordBtn" class="danger-button icon-button record-delete-button" type="button" aria-label="删除记录" title="删除记录" disabled>
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4.5 7.5h15" />
-                    <path d="M9.5 3.75h5" />
-                    <path d="M8.25 3.75h7.5l.75 2.25H7.5l.75-2.25Z" />
-                    <path d="M7.5 7.5v10.25a1.5 1.5 0 0 0 1.5 1.5h6a1.5 1.5 0 0 0 1.5-1.5V7.5" />
-                    <path d="M10 10.25v6.5" />
-                    <path d="M14 10.25v6.5" />
-                  </svg>
-                </button>
-              </div>
-              <div id="recordViewer" class="record-viewer empty-viewer">选择左侧记录后，会在这里以只读 Markdown 方式展示。</div>
-            </section>
-          </div>
-        </section>
       </main>
     </div>
 
@@ -279,6 +233,17 @@
         </div>
         <div id="messageDetailBody" class="message-detail-body"></div>
       </div>
+    </div>
+
+    <div id="appErrorToast" class="app-error-toast hidden" role="alert" aria-live="assertive">
+      <span id="appErrorToastMessage" class="app-error-toast-message"></span>
+      <button id="closeAppErrorToastBtn" class="app-error-toast-close" type="button" aria-label="关闭错误提示">×</button>
+    </div>
+
+    <div id="detailTextTaskBar" class="detail-text-task-bar hidden" role="status" aria-live="polite">
+      <span class="detail-text-task-spinner" aria-hidden="true"></span>
+      <span id="detailTextTaskLabel" class="detail-text-task-label">正在处理模型调用细节...</span>
+      <button id="cancelDetailTextTaskBtn" class="detail-text-task-cancel" type="button" aria-label="取消当前翻译或总结">×</button>
     </div>
 
     <div id="settingsModal" class="modal hidden">
@@ -335,6 +300,6 @@
       </div>
     </div>
 
-    <script defer src="/assets/app.js?v=20260704-detail-text-actions-4"></script>
+    <script defer src="/assets/app.js?v=20260821-runtime-integrity-1"></script>
   </body>
 </html>

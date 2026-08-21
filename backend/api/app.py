@@ -12,10 +12,11 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Path as ApiPath, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -34,11 +35,21 @@ store = SessionStore()
 # manager 负责真正的运行时生命周期控制。
 manager = DebateRunManager(store)
 
+SessionId = Annotated[str, ApiPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+
 
 def create_app() -> FastAPI:
     """创建并组装 FastAPI 应用。"""
 
-    app = FastAPI(title="LLM Debate Studio")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        manager.recover_interrupted_sessions()
+        try:
+            yield
+        finally:
+            await manager.shutdown()
+
+    app = FastAPI(title="LLM Debate Studio", lifespan=lifespan)
 
     @app.middleware("http")
     async def disable_frontend_cache(request: Request, call_next: Any) -> Response:
@@ -98,7 +109,7 @@ def create_app() -> FastAPI:
         return store.list_sessions(archived=True)
 
     @app.get("/api/debates/{session_id}")
-    async def get_debate(session_id: str) -> dict[str, Any]:
+    async def get_debate(session_id: SessionId) -> dict[str, Any]:
         """读取单场辩论详情。"""
 
         session = store.load_session(session_id)
@@ -124,7 +135,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.post("/api/debates/{session_id}/stop")
-    async def stop_debate(session_id: str) -> dict[str, Any]:
+    async def stop_debate(session_id: SessionId) -> dict[str, Any]:
         """终止一场辩论。"""
 
         session = await manager.stop_debate(session_id, reason="用户手动终止")
@@ -133,7 +144,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.post("/api/debates/{session_id}/pause")
-    async def pause_debate(session_id: str) -> dict[str, Any]:
+    async def pause_debate(session_id: SessionId) -> dict[str, Any]:
         """暂停一场辩论。"""
 
         session = await manager.pause_debate(session_id)
@@ -142,7 +153,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.post("/api/debates/{session_id}/resume")
-    async def resume_debate(session_id: str) -> dict[str, Any]:
+    async def resume_debate(session_id: SessionId) -> dict[str, Any]:
         """继续一场已暂停辩论。"""
 
         try:
@@ -158,7 +169,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.post("/api/debates/{session_id}/user-message")
-    async def add_user_message(session_id: str, payload: DebateUserMessageRequest) -> dict[str, Any]:
+    async def add_user_message(session_id: SessionId, payload: DebateUserMessageRequest) -> dict[str, Any]:
         """向辩论中插入一条用户消息。"""
 
         try:
@@ -170,7 +181,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.delete("/api/debates/{session_id}/user-message")
-    async def retract_user_message(session_id: str) -> dict[str, Any]:
+    async def retract_user_message(session_id: SessionId) -> dict[str, Any]:
         """撤回当前可编辑的用户消息。"""
 
         try:
@@ -182,7 +193,7 @@ def create_app() -> FastAPI:
         return result
 
     @app.post("/api/debates/{session_id}/rewind")
-    async def rewind_debate(session_id: str, payload: DebateRewindRequest) -> dict[str, Any]:
+    async def rewind_debate(session_id: SessionId, payload: DebateRewindRequest) -> dict[str, Any]:
         """执行截断撤回，或从记录恢复出一个副本。"""
 
         try:
@@ -196,7 +207,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.put("/api/debates/{session_id}/title")
-    async def update_debate_title(session_id: str, payload: DebateTitleUpdateRequest) -> dict[str, Any]:
+    async def update_debate_title(session_id: SessionId, payload: DebateTitleUpdateRequest) -> dict[str, Any]:
         """修改一场辩论的显示标题。"""
 
         try:
@@ -208,22 +219,27 @@ def create_app() -> FastAPI:
         return session
 
     @app.post("/api/debates/{session_id}/message-detail-view")
-    async def create_message_detail_view(session_id: str, payload: MessageDetailViewRequest) -> dict[str, Any]:
+    async def create_message_detail_view(session_id: SessionId, payload: MessageDetailViewRequest) -> dict[str, Any]:
         """Generate or read cached translation / summary for a message detail text block."""
 
         return await build_message_detail_view(store, session_id, payload)
 
     @app.post("/api/debates/{session_id}/archive")
-    async def archive_debate(session_id: str) -> dict[str, Any]:
+    async def archive_debate(session_id: SessionId) -> dict[str, Any]:
         """归档一场辩论。"""
 
+        current = store.load_session(session_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="未找到该辩论记录。")
+        if str(current.get("status") or "") in {"queued", "running", "paused"}:
+            raise HTTPException(status_code=409, detail="进行中或暂停中的辩论不能归档，请先终止辩论。")
         session = store.archive_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="未找到该辩论记录。")
         return session
 
     @app.post("/api/debates/{session_id}/restore")
-    async def restore_debate(session_id: str) -> dict[str, Any]:
+    async def restore_debate(session_id: SessionId) -> dict[str, Any]:
         """把已归档辩论恢复回主列表。"""
 
         session = store.restore_session(session_id)
@@ -232,7 +248,7 @@ def create_app() -> FastAPI:
         return session
 
     @app.delete("/api/debates/{session_id}")
-    async def delete_debate(session_id: str) -> dict[str, bool]:
+    async def delete_debate(session_id: SessionId) -> dict[str, bool]:
         """删除一场辩论及其关联数据。"""
 
         if store.load_session(session_id) is None:
@@ -246,7 +262,7 @@ def create_app() -> FastAPI:
         return {"deleted": True}
 
     @app.get("/api/debates/{session_id}/export/{kind}")
-    async def export_debate(session_id: str, kind: str) -> Response:
+    async def export_debate(session_id: SessionId, kind: str) -> Response:
         """导出简版或详细版 markdown。"""
 
         if kind not in {"simple", "detail"}:
@@ -261,7 +277,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/debates/{session_id}/events")
-    async def stream_debate_events(session_id: str):
+    async def stream_debate_events(session_id: SessionId):
         """建立某场辩论的 SSE 事件流。"""
 
         if store.load_session(session_id) is None:
@@ -284,7 +300,7 @@ def create_app() -> FastAPI:
         return store.list_records()
 
     @app.get("/api/records/{kind}/{session_id}")
-    async def get_record(kind: str, session_id: str) -> dict[str, Any]:
+    async def get_record(kind: str, session_id: SessionId) -> dict[str, Any]:
         """读取某场辩论的 detail 或 error 记录。"""
 
         record = store.read_record(kind, session_id)
@@ -293,7 +309,7 @@ def create_app() -> FastAPI:
         return record
 
     @app.delete("/api/records/{kind}/{session_id}")
-    async def delete_record(kind: str, session_id: str) -> dict[str, bool]:
+    async def delete_record(kind: str, session_id: SessionId) -> dict[str, bool]:
         """删除某场辩论的 detail 或 error 记录文件。"""
 
         if store.load_session(session_id) is None:

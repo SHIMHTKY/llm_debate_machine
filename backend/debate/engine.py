@@ -74,6 +74,8 @@ async def run_runtime_phase(runtime: DebateState, context: dict[str, Any], logge
             context["pro_tool_mode"],
             context["pro_max_tool_rounds"],
             context["pro_tool_fallback_enabled"],
+            context["pro_response_flow"],
+            context["pro_manual_tools"],
         )
 
     # 反方开篇立论。
@@ -86,6 +88,8 @@ async def run_runtime_phase(runtime: DebateState, context: dict[str, Any], logge
             context["con_tool_mode"],
             context["con_max_tool_rounds"],
             context["con_tool_fallback_enabled"],
+            context["con_response_flow"],
+            context["con_manual_tools"],
         )
 
     # 正方常规轮次发言。
@@ -99,6 +103,8 @@ async def run_runtime_phase(runtime: DebateState, context: dict[str, Any], logge
             context["history_window_size"],
             context["pro_max_tool_rounds"],
             context["pro_tool_fallback_enabled"],
+            context["pro_response_flow"],
+            context["pro_manual_tools"],
         )
 
     # 反方常规轮次发言。
@@ -112,6 +118,8 @@ async def run_runtime_phase(runtime: DebateState, context: dict[str, Any], logge
             context["history_window_size"],
             context["con_max_tool_rounds"],
             context["con_tool_fallback_enabled"],
+            context["con_response_flow"],
+            context["con_manual_tools"],
         )
 
     # 所有发言结束后，进入裁判总结。

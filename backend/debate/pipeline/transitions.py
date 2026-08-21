@@ -29,7 +29,7 @@ def determine_next_phase(runtime: DebateState, executed_phase: str) -> str:
         return "judge_summary" if check_continue(runtime) == "end" else "pro_speech"
     if executed_phase == "judge_summary":
         return "completed"
-    return "completed"
+    raise RuntimeError(f"无法从未知阶段继续：{executed_phase}")
 
 
 def build_runtime_result(runtime: DebateState) -> dict:

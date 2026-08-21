@@ -12,6 +12,10 @@ from ..storage.sessions import SessionStore
 from .schemas import MessageDetailViewRequest
 
 
+MAX_DETAIL_VIEW_INPUT_CHARS = 50000
+SIMPLIFIED_CHINESE_LABELS = {"简体中文", "中文", "zh-cn", "zh_hans", "chinese"}
+
+
 TRANSLATION_SYSTEM_PROMPT = """你是一个严谨的翻译引擎。
 请判断用户输入文本的源语言，并只返回一个 JSON 对象，不要输出 Markdown 或解释。
 JSON 必须包含且仅包含两个字段：
@@ -125,6 +129,8 @@ async def _invoke_model(model_role: str, system_prompt: str, text: str) -> str:
 async def _translate_text(text: str) -> dict[str, Any]:
     raw = await _invoke_model("translator", TRANSLATION_SYSTEM_PROMPT, text)
     parsed = parse_json_response(raw)
+    if not parsed:
+        raise HTTPException(status_code=502, detail="翻译模型未返回可解析的 JSON。")
     translated_content = str(
         parsed.get("翻译内容")
         or parsed.get("translated_content")
@@ -135,11 +141,17 @@ async def _translate_text(text: str) -> dict[str, Any]:
         parsed.get("源语言")
         or parsed.get("source_language")
         or parsed.get("language")
-        or "未知"
+        or ""
     ).strip()
+    if not source_language:
+        raise HTTPException(status_code=502, detail="翻译模型未返回源语言。")
+    normalized_source = source_language.strip().lower()
+    source_is_simplified_chinese = normalized_source in SIMPLIFIED_CHINESE_LABELS or "简体中文" in source_language
+    if not translated_content and not source_is_simplified_chinese:
+        raise HTTPException(status_code=502, detail="翻译模型返回了空翻译内容。")
     return {
         "view": "translation",
-        "source_language": source_language or "未知",
+        "source_language": source_language,
         "translated_content": translated_content,
     }
 
@@ -147,6 +159,8 @@ async def _translate_text(text: str) -> dict[str, Any]:
 async def _summarize_text(text: str, content_kind: str) -> dict[str, Any]:
     prompt = REASONING_SUMMARY_SYSTEM_PROMPT if content_kind == "reasoning" else TOOL_RESULT_SUMMARY_SYSTEM_PROMPT
     summary = await _invoke_model("summarizer", prompt, text)
+    if not summary:
+        raise HTTPException(status_code=502, detail="总结模型返回了空内容。")
     return {
         "view": "summary",
         "summary_content": summary,
@@ -165,6 +179,8 @@ async def build_message_detail_view(
     container, text = _target_container(session, payload)
     if not text:
         raise HTTPException(status_code=400, detail="该文本为空，无法处理。")
+    if len(text) > MAX_DETAIL_VIEW_INPUT_CHARS:
+        raise HTTPException(status_code=413, detail=f"待处理文本超过 {MAX_DETAIL_VIEW_INPUT_CHARS} 字符限制。")
 
     cached = _cached_view(container, payload.view)
     if cached is not None:

@@ -5,7 +5,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .constants import DEFAULT_CONTEXT_ROUNDS, MAX_DEBATER_PRESETS, VALID_PROVIDERS, VALID_TOOL_MODES
-from .defaults import _default_model, _default_search, _default_tool_config, _default_tool_selection, default_settings
+from .defaults import (
+    _default_model,
+    _default_response_flow,
+    _default_search,
+    _default_tool_config,
+    _default_tool_selection,
+    default_settings,
+)
 from .helpers import (
     _coerce_bool,
     _create_preset_id,
@@ -26,6 +33,26 @@ DEFAULT_TAVILY_TOOL_ID = "tool_tavily_search"
 DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS = 2500
 MIN_TOOL_OUTPUT_TRUNCATE_CHARS = 500
 MAX_TOOL_OUTPUT_TRUNCATE_CHARS = 20000
+MAX_TOOL_ROUNDS = 8
+MAX_TOOL_TIMEOUT_SECONDS = 300
+MAX_MODEL_TOKENS = 131072
+MAX_MODEL_TIMEOUT_SECONDS = 3600
+MAX_MODEL_RETRIES = 10
+MAX_RESPONSE_FLOW_BLOCKS = 10
+MIN_DEEP_THINKING_TOKENS = 128
+MAX_DEEP_THINKING_TOKENS = 32768
+VALID_RESPONSE_FLOW_MODES = {"autonomous", "manual"}
+VALID_SEARCH_DEPTHS = {"basic", "advanced", "fast", "ultra-fast"}
+
+
+def _bounded_positive_int(value: Any, fallback: Any, maximum: int, minimum: int = 1) -> int:
+    parsed = _positive_int(value, _positive_int(fallback, minimum))
+    return max(minimum, min(parsed, maximum))
+
+
+def _normalize_search_depth(value: Any, fallback: Any = "advanced") -> str:
+    depth = _text(value, _text(fallback, "advanced")).lower() or "advanced"
+    return depth if depth in VALID_SEARCH_DEPTHS else "advanced"
 
 
 def _normalize_tool_output_truncate_chars(value: Any, fallback: Any = DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS) -> int:
@@ -48,14 +75,14 @@ def _normalize_search_settings(
         "enabled": _coerce_bool(search.get("enabled"), _coerce_bool(defaults["enabled"])),
         "mode": mode,
         "api_key": _normalize_secret(search.get("api_key"), _text(existing_search.get("api_key"), defaults["api_key"])),
-        "timeout": _positive_int(search.get("timeout"), defaults["timeout"]),
+        "timeout": _bounded_positive_int(search.get("timeout"), defaults["timeout"], MAX_TOOL_TIMEOUT_SECONDS),
         "max_results": _positive_int(search.get("max_results"), defaults["max_results"]),
-        "search_depth": _text(search.get("search_depth"), defaults["search_depth"]) or defaults["search_depth"],
+        "search_depth": _normalize_search_depth(search.get("search_depth"), defaults["search_depth"]),
         "output_truncate_chars": _normalize_tool_output_truncate_chars(
             search.get("output_truncate_chars"),
             defaults.get("output_truncate_chars", DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS),
         ),
-        "max_tool_rounds": _positive_int(search.get("max_tool_rounds"), defaults.get("max_tool_rounds", 2)),
+        "max_tool_rounds": _bounded_positive_int(search.get("max_tool_rounds"), defaults.get("max_tool_rounds", 2), MAX_TOOL_ROUNDS),
         "fallback_enabled": _coerce_bool(search.get("fallback_enabled"), _coerce_bool(defaults.get("fallback_enabled"), False)),
     }
 
@@ -86,9 +113,9 @@ def _normalize_model_settings(
         ),
         "azure_deployment": _text(model.get("azure_deployment"), defaults["azure_deployment"]),
         "api_version": _text(model.get("api_version"), defaults["api_version"]),
-        "max_tokens": _positive_int(model.get("max_tokens"), defaults["max_tokens"]),
-        "timeout": _positive_int(model.get("timeout"), defaults["timeout"]),
-        "max_retries": _positive_int(model.get("max_retries"), defaults["max_retries"]),
+        "max_tokens": _bounded_positive_int(model.get("max_tokens"), defaults["max_tokens"], MAX_MODEL_TOKENS),
+        "timeout": _bounded_positive_int(model.get("timeout"), defaults["timeout"], MAX_MODEL_TIMEOUT_SECONDS),
+        "max_retries": _bounded_positive_int(model.get("max_retries"), defaults["max_retries"], MAX_MODEL_RETRIES),
     }
 
     if include_search:
@@ -119,8 +146,8 @@ def _normalize_supplier_settings(
         "api_key": _normalize_secret(supplier.get("api_key"), _text(existing_supplier.get("api_key"), defaults.get("api_key", ""))),
         "base_url": _text(supplier.get("base_url"), defaults.get("base_url", "")),
         "api_version": _text(supplier.get("api_version"), defaults.get("api_version", "")),
-        "timeout": _positive_int(supplier.get("timeout"), _positive_int(defaults.get("timeout"), 300)),
-        "max_retries": _positive_int(supplier.get("max_retries"), _positive_int(defaults.get("max_retries"), 2)),
+        "timeout": _bounded_positive_int(supplier.get("timeout"), defaults.get("timeout", 300), MAX_MODEL_TIMEOUT_SECONDS),
+        "max_retries": _bounded_positive_int(supplier.get("max_retries"), defaults.get("max_retries", 2), MAX_MODEL_RETRIES),
     }
 
 
@@ -176,9 +203,9 @@ def _normalize_tool_config(
         "type": template_id,
         "enabled": _coerce_bool(tool.get("enabled"), _coerce_bool(defaults.get("enabled"), False)),
         "api_key": _normalize_secret(tool.get("api_key"), _text(existing_tool.get("api_key"), defaults.get("api_key", ""))),
-        "timeout": _positive_int(tool.get("timeout"), _positive_int(defaults.get("timeout"), 60)),
+        "timeout": _bounded_positive_int(tool.get("timeout"), defaults.get("timeout", 60), MAX_TOOL_TIMEOUT_SECONDS),
         "max_results": max(1, min(_positive_int(tool.get("max_results"), _positive_int(defaults.get("max_results"), 5)), 10)),
-        "search_depth": _text(tool.get("search_depth"), defaults.get("search_depth", "advanced")) or "advanced",
+        "search_depth": _normalize_search_depth(tool.get("search_depth"), defaults.get("search_depth", "advanced")),
         "output_truncate_chars": _normalize_tool_output_truncate_chars(
             tool.get("output_truncate_chars"),
             defaults.get("output_truncate_chars", DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS),
@@ -241,6 +268,7 @@ def _normalize_tool_selection(
     )
     if legacy and not selection:
         max_tool_rounds = _positive_int(legacy.get("max_tool_rounds"), max_tool_rounds)
+    max_tool_rounds = min(MAX_TOOL_ROUNDS, max(1, max_tool_rounds))
 
     fallback_enabled = _coerce_bool(
         selection.get("fallback_enabled"),
@@ -269,6 +297,64 @@ def _normalize_tool_selection(
         "max_tool_rounds": max_tool_rounds,
         "fallback_enabled": fallback_enabled,
     }
+
+
+def _normalize_response_flow(
+    raw_flow: Any,
+    existing_flow: dict[str, Any] | None,
+    available_tool_ids: list[str],
+) -> dict[str, Any]:
+    defaults = _default_response_flow()
+    flow = raw_flow if isinstance(raw_flow, dict) else {}
+    existing = existing_flow if isinstance(existing_flow, dict) else defaults
+    mode = _text(flow.get("mode"), _text(existing.get("mode"), defaults["mode"])).lower()
+    if mode not in VALID_RESPONSE_FLOW_MODES:
+        mode = defaults["mode"]
+
+    raw_blocks = flow.get("blocks")
+    if not isinstance(raw_blocks, list):
+        raw_blocks = existing.get("blocks") if isinstance(existing.get("blocks"), list) else defaults["blocks"]
+
+    blocks: list[dict[str, Any]] = [{"id": "flow_start", "type": "start"}]
+    used_ids = {"flow_start", "flow_final"}
+    intermediate_limit = max(0, MAX_RESPONSE_FLOW_BLOCKS - 2)
+    for index, raw_block in enumerate(raw_blocks):
+        if len(blocks) - 1 >= intermediate_limit or not isinstance(raw_block, dict):
+            break
+        block_type = _text(raw_block.get("type")).lower()
+        if block_type not in {"deep_thinking", "tool_call"}:
+            continue
+        block_id = _text(raw_block.get("id")) or f"flow_block_{index + 1}"
+        if block_id in used_ids:
+            block_id = f"flow_block_{index + 1}"
+        while block_id in used_ids:
+            block_id += "_copy"
+        used_ids.add(block_id)
+        if block_type == "deep_thinking":
+            blocks.append(
+                {
+                    "id": block_id,
+                    "type": block_type,
+                    "max_tokens": _bounded_positive_int(
+                        raw_block.get("max_tokens"),
+                        2048,
+                        MAX_DEEP_THINKING_TOKENS,
+                        minimum=MIN_DEEP_THINKING_TOKENS,
+                    ),
+                }
+            )
+            continue
+        tool_id = _text(raw_block.get("tool_id"))
+        blocks.append(
+            {
+                "id": block_id,
+                "type": block_type,
+                "tool_id": tool_id if tool_id in available_tool_ids else "",
+            }
+        )
+
+    blocks.append({"id": "flow_final", "type": "final_response"})
+    return {"mode": mode, "blocks": blocks}
 
 
 def _supplier_label_from_model(model: dict[str, Any]) -> str:
@@ -316,6 +402,7 @@ def _light_preset_from_full_model(model: dict[str, Any], supplier_id: str, fallb
         "azure_deployment": _text(model.get("azure_deployment")),
         "max_tokens": _positive_int(model.get("max_tokens"), 8000),
         "extra_body": deepcopy(model.get("extra_body")) if isinstance(model.get("extra_body"), dict) else {},
+        "response_flow": deepcopy(model.get("response_flow")) if isinstance(model.get("response_flow"), dict) else _default_response_flow(),
         "search": deepcopy(model.get("search")) if isinstance(model.get("search"), dict) else _default_model("pro")["search"],
     }
 
@@ -567,7 +654,11 @@ def _normalize_debater_presets(
                 raw_preset.get("azure_deployment"),
                 _text(existing_preset.get("azure_deployment")) if existing_preset else fallback_default.get("azure_deployment", ""),
             ),
-            "max_tokens": _positive_int(raw_preset.get("max_tokens"), _positive_int((existing_preset or {}).get("max_tokens"), fallback_default.get("max_tokens", 8000))),
+            "max_tokens": _bounded_positive_int(
+                raw_preset.get("max_tokens"),
+                (existing_preset or {}).get("max_tokens", fallback_default.get("max_tokens", 8000)),
+                MAX_MODEL_TOKENS,
+            ),
             "extra_body": _normalize_extra_body(
                 raw_preset.get("extra_body"),
                 existing_preset.get("extra_body") if existing_preset and isinstance(existing_preset.get("extra_body"), dict) else fallback_default.get("extra_body"),
@@ -578,6 +669,11 @@ def _normalize_debater_presets(
                 existing_preset.get("tool_selection") if existing_preset and isinstance(existing_preset.get("tool_selection"), dict) else fallback_default.get("tool_selection"),
                 tool_ids,
                 legacy_search=raw_preset.get("search") if isinstance(raw_preset.get("search"), dict) else None,
+            ),
+            "response_flow": _normalize_response_flow(
+                raw_preset.get("response_flow"),
+                existing_preset.get("response_flow") if existing_preset and isinstance(existing_preset.get("response_flow"), dict) else fallback_default.get("response_flow"),
+                tool_ids,
             ),
         }
         if normalized_preset["id"] in used_ids:
@@ -591,6 +687,7 @@ def _normalize_debater_presets(
     if fallback:
         fallback[0]["supplier_id"] = fallback[0].get("supplier_id") if fallback[0].get("supplier_id") in supplier_ids else fallback_supplier_id
         fallback[0]["tool_selection"] = _normalize_tool_selection(fallback[0].get("tool_selection"), None, tool_ids)
+        fallback[0]["response_flow"] = _normalize_response_flow(fallback[0].get("response_flow"), None, tool_ids)
         fallback[0].pop("search", None)
         if not _text(fallback[0].get("id")):
             fallback[0]["id"] = _create_preset_id()
@@ -622,7 +719,11 @@ def _normalize_judge_settings(
             judge.get("azure_deployment"),
             _text(base_judge.get("azure_deployment"), default_judge.get("azure_deployment", "")),
         ),
-        "max_tokens": _positive_int(judge.get("max_tokens"), _positive_int(base_judge.get("max_tokens"), default_judge.get("max_tokens", 4096))),
+        "max_tokens": _bounded_positive_int(
+            judge.get("max_tokens"),
+            base_judge.get("max_tokens", default_judge.get("max_tokens", 4096)),
+            MAX_MODEL_TOKENS,
+        ),
         "extra_body": _normalize_extra_body(
             judge.get("extra_body"),
             base_judge.get("extra_body") if isinstance(base_judge.get("extra_body"), dict) else default_judge.get("extra_body"),
@@ -736,7 +837,7 @@ def _resolve_search_from_tool_selection(
     mode = _text(selection.get("mode"), default_search["mode"]).lower()
     if mode not in VALID_TOOL_MODES:
         mode = default_search["mode"]
-    max_tool_rounds = _positive_int(selection.get("max_tool_rounds"), default_search["max_tool_rounds"])
+    max_tool_rounds = _bounded_positive_int(selection.get("max_tool_rounds"), default_search["max_tool_rounds"], MAX_TOOL_ROUNDS)
     fallback_enabled = _coerce_bool(selection.get("fallback_enabled"), _coerce_bool(default_search.get("fallback_enabled"), False))
 
     if not selected_tool:
@@ -755,9 +856,9 @@ def _resolve_search_from_tool_selection(
         "enabled": True,
         "mode": mode,
         "api_key": _text(selected_tool.get("api_key")),
-        "timeout": _positive_int(selected_tool.get("timeout"), default_search["timeout"]),
+        "timeout": _bounded_positive_int(selected_tool.get("timeout"), default_search["timeout"], MAX_TOOL_TIMEOUT_SECONDS),
         "max_results": max(1, min(_positive_int(selected_tool.get("max_results"), default_search["max_results"]), 10)),
-        "search_depth": _text(selected_tool.get("search_depth"), default_search["search_depth"]) or default_search["search_depth"],
+        "search_depth": _normalize_search_depth(selected_tool.get("search_depth"), default_search["search_depth"]),
         "output_truncate_chars": _normalize_tool_output_truncate_chars(
             selected_tool.get("output_truncate_chars"),
             default_search["output_truncate_chars"],
@@ -793,10 +894,11 @@ def _merge_supplier_with_preset(
         "extra_body": deepcopy(preset.get("extra_body")) if isinstance(preset.get("extra_body"), dict) else {},
         "azure_deployment": azure_deployment,
         "api_version": _text(supplier.get("api_version")),
-        "max_tokens": _positive_int(preset.get("max_tokens"), 8000),
-        "timeout": _positive_int(supplier.get("timeout"), 300),
-        "max_retries": _positive_int(supplier.get("max_retries"), 2),
+        "max_tokens": _bounded_positive_int(preset.get("max_tokens"), 8000, MAX_MODEL_TOKENS),
+        "timeout": _bounded_positive_int(supplier.get("timeout"), 300, MAX_MODEL_TIMEOUT_SECONDS),
+        "max_retries": _bounded_positive_int(supplier.get("max_retries"), 2, MAX_MODEL_RETRIES),
         "tool_selection": deepcopy(selection),
+        "response_flow": deepcopy(preset.get("response_flow")) if isinstance(preset.get("response_flow"), dict) else _default_response_flow(),
         "search": _resolve_search_from_tool_selection(selection, tools_by_id),
     }
 
@@ -819,9 +921,9 @@ def _merge_supplier_with_judge(
         "extra_body": deepcopy(judge.get("extra_body")) if isinstance(judge.get("extra_body"), dict) else {},
         "azure_deployment": azure_deployment,
         "api_version": _text(supplier.get("api_version")),
-        "max_tokens": _positive_int(judge.get("max_tokens"), 4096),
-        "timeout": _positive_int(supplier.get("timeout"), 120),
-        "max_retries": _positive_int(supplier.get("max_retries"), 2),
+        "max_tokens": _bounded_positive_int(judge.get("max_tokens"), 4096, MAX_MODEL_TOKENS),
+        "timeout": _bounded_positive_int(supplier.get("timeout"), 120, MAX_MODEL_TIMEOUT_SECONDS),
+        "max_retries": _bounded_positive_int(supplier.get("max_retries"), 2, MAX_MODEL_RETRIES),
     }
 
 

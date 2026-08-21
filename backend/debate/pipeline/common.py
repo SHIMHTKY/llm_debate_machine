@@ -229,13 +229,17 @@ def usage_payload_to_dict(payload: Any) -> dict[str, int] | None:
     return None
 
 
-def message_text(messages: list[dict[str, Any]]) -> str:
+def message_text(messages: list[Any]) -> str:
     """把消息数组压平成文本，供 token 估算使用。"""
 
     blocks: list[str] = []
     for message in messages:
-        role = str(message.get("role") or "user")
-        content = message.get("content", "")
+        if isinstance(message, dict):
+            role = str(message.get("role") or "user")
+            content = message.get("content", "")
+        else:
+            role = str(getattr(message, "type", None) or getattr(message, "role", None) or "user")
+            content = getattr(message, "content", "")
         if isinstance(content, list):
             # 如果 content 本身是多段块结构，先拼成一个普通字符串。
             content = "\n".join(str(item) for item in content if item is not None)
@@ -265,7 +269,7 @@ def estimate_text_tokens(llm: Any, text: str) -> int:
     return max(1, math.ceil(len(cleaned) * 0.8))
 
 
-def estimate_usage(llm: Any, messages: list[dict[str, Any]], response_text: str) -> dict[str, int]:
+def estimate_usage(llm: Any, messages: list[Any], response_text: str) -> dict[str, int]:
     """估算一次模型调用的 usage。"""
 
     input_tokens = estimate_text_tokens(llm, message_text(messages))
@@ -277,7 +281,7 @@ def estimate_usage(llm: Any, messages: list[dict[str, Any]], response_text: str)
     }
 
 
-def extract_usage(response: Any, llm: Any, messages: list[dict[str, Any]]) -> tuple[dict[str, int], bool, str]:
+def extract_usage(response: Any, llm: Any, messages: list[Any]) -> tuple[dict[str, int], bool, str]:
     """从模型响应中提取 usage；若取不到则回退估算。"""
 
     response_text = response_to_text(response)

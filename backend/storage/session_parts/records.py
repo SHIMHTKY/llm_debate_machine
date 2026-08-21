@@ -104,6 +104,7 @@ class SessionRecordMixin:
                     removable.add(str(record_path))
             for record_path in removable:
                 Path(record_path).unlink(missing_ok=True)
+            self._runtime_config_path(session_id).unlink(missing_ok=True)
             self._session_path(session_id).unlink(missing_ok=True)
             return True
 

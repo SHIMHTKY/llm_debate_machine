@@ -62,6 +62,7 @@ class RewindManagerMixin:
             min_rounds=int(source_session.get("min_rounds") or 1),
             max_rounds=int(source_session.get("max_rounds") or 1),
             config_summary=deepcopy(source_session.get("config_summary") or {}),
+            runtime_settings=self.store.load_runtime_settings(str(source_session.get("id") or "")),
         )
         updated = self.store.update_session(
             session["id"],

@@ -31,7 +31,7 @@ from .manager_support_parts.rewind import (
     resolve_rewind_target,
     restore_trailing_user_message,
 )
-from .manager_support_parts.session_view import find_preset_by_name, is_judge_phase, session_display_title
+from .manager_support_parts.session_view import find_preset, find_preset_by_name, is_judge_phase, session_display_title
 from .manager_support_parts.usage import (
     append_usage_timeline_entry,
     combine_usage_summaries,
@@ -52,6 +52,7 @@ __all__ = [
     "empty_usage_role_stats",
     "empty_usage_stage_stats",
     "empty_usage_summary",
+    "find_preset",
     "find_preset_by_name",
     "format_user_detail_message",
     "is_judge_phase",

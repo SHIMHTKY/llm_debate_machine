@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
+
+from langchain_core.messages import ToolMessage
 
 from ..logger import DebateLogger
 from .common import (
@@ -22,6 +25,10 @@ from .common import (
 DEFAULT_TOOL_OUTPUT_TRUNCATE_CHARS = 2500
 MIN_TOOL_OUTPUT_TRUNCATE_CHARS = 500
 MAX_TOOL_OUTPUT_TRUNCATE_CHARS = 20000
+MAX_TOOL_ROUNDS = 8
+MAX_MANUAL_FLOW_BLOCKS = 10
+MIN_DEEP_THINKING_TOKENS = 128
+MAX_DEEP_THINKING_TOKENS = 32768
 
 
 async def ainvoke_with_metrics(
@@ -98,8 +105,9 @@ def normalize_tool_args(args: Any, fallback_query: str) -> dict[str, Any]:
         normalized = {}
 
     query = normalized.get("query") or normalized.get("q") or normalized.get("search_query") or normalized.get("keywords")
-    normalized["query"] = str(query or fallback_query).strip() or fallback_query
-    return normalized
+    normalized_query = str(query or fallback_query).strip() or fallback_query
+    # The current web_search schema accepts only query; discard hallucinated provider arguments.
+    return {"query": normalized_query[:120]}
 
 
 def extract_tool_action(text: str) -> dict[str, Any] | None:
@@ -138,13 +146,13 @@ def extract_tool_action(text: str) -> dict[str, Any] | None:
 
 
 def find_tool(tools: list[Any], tool_name: str) -> Any | None:
-    """按名称查找工具，找不到时退回第一个工具。"""
+    """按名称查找工具；未知名称绝不能误执行其它工具。"""
 
     normalized = str(tool_name or "web_search").strip()
     for tool in tools:
         if getattr(tool, "name", "") == normalized:
             return tool
-    return tools[0] if tools else None
+    return None
 
 
 def format_tool_result(tool_name: str, args: dict[str, Any], result: str) -> str:
@@ -186,7 +194,7 @@ async def execute_tool_action(
 
     tool = find_tool(tools, str(action.get("name") or "web_search"))
     if tool is None:
-        return ""
+        return f"工具 `{str(action.get('name') or '').strip() or 'unknown'}` 不可用。"
     tool_name = getattr(tool, "name", "web_search")
     tool_args = normalize_tool_args(action.get("args"), fallback_query)
     try:
@@ -216,6 +224,140 @@ async def execute_fallback_search(
         role_key,
         agent_name,
         fallback=True,
+    )
+
+
+def _internal_response_text(response: Any, *, include_reasoning: bool = False) -> str:
+    text = clean_tool_artifacts(response_to_text(response)).strip()
+    reasoning = extract_reasoning_details(response)
+    reasoning_text = "\n\n".join(
+        str(item.get("content") or "").strip()
+        for item in reasoning
+        if str(item.get("content") or "").strip()
+    )
+    if include_reasoning and reasoning_text and text:
+        return f"【模型思考】\n{reasoning_text}\n\n【模型输出】\n{text}"
+    return text or reasoning_text
+
+
+def _manual_flow_prompt(user_message: str, internal_sections: list[str], instruction: str) -> str:
+    sections = [user_message.strip()]
+    if internal_sections:
+        sections.extend(["【本次发言的内部工作记录】", "\n\n".join(internal_sections)])
+    sections.extend(["【当前编排步骤】", instruction.strip()])
+    return "\n\n".join(section for section in sections if section)
+
+
+def _manual_tool_query(response_text: str, fallback_query: str) -> dict[str, Any]:
+    payload = parse_json_response(response_text)
+    candidate: Any = payload if payload else response_text
+    return normalize_tool_args(candidate, fallback_query)
+
+
+async def run_manual_flow(
+    llm: Any,
+    tools_by_id: dict[str, Any],
+    response_flow: dict[str, Any],
+    system_prompt: str,
+    user_message: str,
+    logger: DebateLogger,
+    role_key: str,
+    agent_name: str,
+    stage_label: str,
+) -> str:
+    """Execute a deterministic private chain and expose only its final speech."""
+
+    blocks = response_flow.get("blocks") if isinstance(response_flow.get("blocks"), list) else []
+    internal_sections: list[str] = []
+    step_index = 0
+    for block in blocks[:MAX_MANUAL_FLOW_BLOCKS]:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type in {"start", "final_response"}:
+            continue
+        step_index += 1
+        if block_type == "deep_thinking":
+            max_tokens = min(
+                MAX_DEEP_THINKING_TOKENS,
+                max(MIN_DEEP_THINKING_TOKENS, coerce_int(block.get("max_tokens")) or 2048),
+            )
+            instruction = (
+                "请对本轮辩论任务进行一次独立的深度思考。分析论证结构、对方漏洞、事实需求和反驳策略；"
+                "这里只生成供后续步骤使用的内部分析，不要写成面向用户的正式发言，也不要调用工具。"
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": _manual_flow_prompt(user_message, internal_sections, instruction)},
+            ]
+            try:
+                thinking_llm = llm.bind(max_tokens=max_tokens)
+            except Exception:
+                thinking_llm = llm
+            response = await ainvoke_with_metrics(
+                thinking_llm,
+                messages,
+                logger,
+                role_key,
+                f"{stage_label} · 深度思考 {step_index}",
+                estimate_llm=llm,
+            )
+            thinking_text = _internal_response_text(response, include_reasoning=True) or "本步骤未返回可用的内部分析。"
+            visible_thinking = _internal_response_text(response) or thinking_text
+            logger.log_manual_thinking(role_key, f"深度思考 {step_index}", visible_thinking, max_tokens)
+            internal_sections.append(f"【深度思考 {step_index}】\n{thinking_text}")
+            continue
+
+        if block_type == "tool_call":
+            tool_id = str(block.get("tool_id") or "").strip()
+            tool = tools_by_id.get(tool_id)
+            if tool is None:
+                raise RuntimeError(f"人工编排的工具调用块未绑定可用工具：{tool_id or '未选择工具'}")
+            fallback_query = build_fallback_search_query(user_message)
+            planner_instruction = (
+                "现在必须调用一次指定搜索工具。请根据辩题、最近发言和已有内部记录，自主决定最有价值的搜索参数。"
+                "只返回 JSON：{\"query\":\"不超过 120 字的搜索词\"}，不要输出正式发言。"
+            )
+            planner_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": _manual_flow_prompt(user_message, internal_sections, planner_instruction)},
+            ]
+            planner_response = await ainvoke_with_metrics(
+                llm,
+                planner_messages,
+                logger,
+                role_key,
+                f"{stage_label} · 工具规划 {step_index}",
+                estimate_llm=llm,
+            )
+            planner_text = _internal_response_text(planner_response)
+            planner_context = _internal_response_text(planner_response, include_reasoning=True)
+            tool_args = _manual_tool_query(planner_text, fallback_query)
+            tool_name = str(getattr(tool, "name", "web_search") or "web_search")
+            result = await execute_tool_action(
+                [tool],
+                {"name": tool_name, "args": tool_args},
+                fallback_query,
+                logger,
+                role_key,
+                agent_name,
+            )
+            internal_sections.append(
+                f"【工具规划 {step_index}】\n{planner_context or planner_text or '模型未返回可见规划文本。'}\n\n"
+                f"【工具调用 {step_index}】\n{result}"
+            )
+
+    final_instruction = (
+        "现在进入正式发言块。请完整吸收以上仅属于本次发言的内部思考和工具结果，"
+        "只输出最终辩论发言；不要提及内部流程、积木、工具协议或思考记录，也不要再次调用工具。"
+    )
+    return await run_plain_mode(
+        llm,
+        system_prompt,
+        _manual_flow_prompt(user_message, internal_sections, final_instruction),
+        logger,
+        role_key,
+        f"{stage_label} · 正式发言",
     )
 
 
@@ -287,7 +429,7 @@ async def run_bind_tools_mode(
 
     # bind_tools 的核心思想是：让模型直接决定何时触发工具调用。
     tool_results: list[str] = []
-    max_tool_rounds = max(1, coerce_int(max_tool_rounds) or 2)
+    max_tool_rounds = min(MAX_TOOL_ROUNDS, max(1, coerce_int(max_tool_rounds) or 2))
 
     bind_system_prompt = (
         f"{system_prompt}\n\n"
@@ -311,14 +453,16 @@ async def run_bind_tools_mode(
             stage_label,
         )
 
+    conversation: list[Any] = [
+        {"role": "system", "content": bind_system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
     for round_index in range(max_tool_rounds):
         try:
             response = await ainvoke_with_metrics(
                 llm_with_tools,
-                [
-                    {"role": "system", "content": bind_system_prompt},
-                    {"role": "user", "content": compose_user_message(user_message, tool_results)},
-                ],
+                conversation,
                 logger,
                 role_key,
                 stage_label,
@@ -341,9 +485,17 @@ async def run_bind_tools_mode(
                 if fallback_result:
                     tool_results.append(fallback_result)
                     break
-            # 没有工具调用且已经有工具结果时，说明模型给出了最终答案。
-            return clean_tool_artifacts(response_to_text(response))
+            # 没有工具调用通常表示最终答案；空正文则转入统一的纯回答兜底。
+            final_text = clean_tool_artifacts(response_to_text(response))
+            if final_text:
+                return final_text
+            break
 
+        # Standard bind_tools flow: assistant tool call -> matching ToolMessage(s).
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and not str(tool_call.get("id") or "").strip():
+                tool_call["id"] = f"call_{uuid.uuid4().hex}"
+        conversation.append(response)
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "")
             fallback_query = build_fallback_search_query(user_message)
@@ -357,6 +509,13 @@ async def run_bind_tools_mode(
             )
             if result:
                 tool_results.append(result)
+                conversation.append(
+                    ToolMessage(
+                        content=result,
+                        tool_call_id=str(tool_call.get("id") or f"call_{uuid.uuid4().hex}"),
+                        name=str(tool_name or "web_search"),
+                    )
+                )
 
     # 达到最大工具轮数后，强制进入纯回答模式，避免 agent 无限找资料不产出答案。
     return await run_plain_mode(
@@ -391,7 +550,7 @@ async def run_react_mode(
     # 如果直接复用它做工具规划，会和 ReAct JSON 协议互相打架。
     tool_descriptions = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
     tool_results: list[str] = []
-    max_tool_rounds = max(1, coerce_int(max_tool_rounds) or 2)
+    max_tool_rounds = min(MAX_TOOL_ROUNDS, max(1, coerce_int(max_tool_rounds) or 2))
     fallback_query = build_fallback_search_query(user_message)
 
     for round_index in range(max_tool_rounds):
@@ -470,9 +629,24 @@ async def run_agent(
     stage_label: str,
     max_tool_rounds: int,
     tool_fallback_enabled: bool = False,
+    response_flow: dict[str, Any] | None = None,
+    manual_tools: dict[str, Any] | None = None,
 ) -> str:
     """统一的辩手代理入口。"""
 
+    normalized_flow = response_flow if isinstance(response_flow, dict) else {}
+    if str(normalized_flow.get("mode") or "autonomous").lower() == "manual":
+        return await run_manual_flow(
+            llm,
+            manual_tools or {},
+            normalized_flow,
+            system_prompt,
+            user_message,
+            logger,
+            role_key,
+            agent_name,
+            stage_label,
+        )
     if not tools:
         return await run_plain_mode(llm, system_prompt, user_message, logger, role_key, stage_label)
     if tool_mode == "react":
