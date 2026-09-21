@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from typing import Any
 
@@ -14,6 +15,40 @@ from .schemas import MessageDetailViewRequest
 
 MAX_DETAIL_VIEW_INPUT_CHARS = 50000
 SIMPLIFIED_CHINESE_LABELS = {"简体中文", "中文", "zh-cn", "zh_hans", "chinese"}
+_DETAIL_TASKS: dict[str, asyncio.Task[Any]] = {}
+
+
+def register_detail_task(task_id: str, task: asyncio.Task[Any]) -> None:
+    """Register one active translation/summary request for cancellation."""
+
+    for existing_id, existing_task in list(_DETAIL_TASKS.items()):
+        if existing_task.done():
+            _DETAIL_TASKS.pop(existing_id, None)
+    if _DETAIL_TASKS:
+        raise HTTPException(status_code=409, detail="已有翻译或总结请求正在执行，请等待完成或取消。")
+    _DETAIL_TASKS[task_id] = task
+
+
+def unregister_detail_task(task_id: str, task: asyncio.Task[Any] | None = None) -> None:
+    current = _DETAIL_TASKS.get(task_id)
+    if current is not None and (task is None or current is task):
+        _DETAIL_TASKS.pop(task_id, None)
+
+
+def cancel_detail_task(task_id: str) -> bool:
+    task = _DETAIL_TASKS.get(task_id)
+    if task is None or task.done():
+        _DETAIL_TASKS.pop(task_id, None)
+        return False
+    return task.cancel()
+
+
+def finish_detail_task(task_id: str, task: asyncio.Task[Any]) -> None:
+    """Remove detached tasks and consume late exceptions after client disconnects."""
+
+    unregister_detail_task(task_id, task)
+    if not task.cancelled():
+        task.exception()
 
 
 TRANSLATION_SYSTEM_PROMPT = """你是一个严谨的翻译引擎。

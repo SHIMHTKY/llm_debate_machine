@@ -61,3 +61,4 @@ class MessageDetailViewRequest(BaseModel):
     content_kind: Literal["reasoning", "tool_result"]
     view: Literal["translation", "summary"]
     entry_index: int | None = Field(default=None, ge=0)
+    task_id: str | None = Field(default=None, min_length=1, max_length=128)

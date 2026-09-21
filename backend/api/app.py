@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from uuid import uuid4
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -22,7 +24,13 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config.settings import load_settings_for_frontend, save_settings_for_frontend
 from ..storage.sessions import SessionStore
-from .detail_views import build_message_detail_view
+from .detail_views import (
+    build_message_detail_view,
+    cancel_detail_task,
+    finish_detail_task,
+    register_detail_task,
+    unregister_detail_task,
+)
 from .manager import DebateCapacityError, DebateResumeError, DebateRunManager, DebateStateError
 from .schemas import DebateRewindRequest, DebateStartRequest, DebateTitleUpdateRequest, DebateUserMessageRequest, MessageDetailViewRequest
 
@@ -36,6 +44,7 @@ store = SessionStore()
 manager = DebateRunManager(store)
 
 SessionId = Annotated[str, ApiPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+DetailTaskId = Annotated[str, ApiPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
 def create_app() -> FastAPI:
@@ -222,7 +231,30 @@ def create_app() -> FastAPI:
     async def create_message_detail_view(session_id: SessionId, payload: MessageDetailViewRequest) -> dict[str, Any]:
         """Generate or read cached translation / summary for a message detail text block."""
 
-        return await build_message_detail_view(store, session_id, payload)
+        task_id = str(payload.task_id or uuid4().hex)
+        task = asyncio.create_task(build_message_detail_view(store, session_id, payload), name=f"detail:{task_id}")
+        try:
+            register_detail_task(task_id, task)
+        except HTTPException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                return {"cancelled": True, "task_id": task_id}
+            task.add_done_callback(lambda completed: finish_detail_task(task_id, completed))
+            raise
+        finally:
+            if task.done():
+                unregister_detail_task(task_id, task)
+
+    @app.post("/api/detail-tasks/{task_id}/cancel")
+    async def cancel_message_detail_task(task_id: DetailTaskId) -> dict[str, Any]:
+        """Cancel the active translation/summary model request."""
+
+        return {"task_id": task_id, "cancelled": cancel_detail_task(task_id)}
 
     @app.post("/api/debates/{session_id}/archive")
     async def archive_debate(session_id: SessionId) -> dict[str, Any]:

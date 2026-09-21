@@ -898,6 +898,18 @@ label span {
   color: #9f4b43;
 }
 
+.terminate-button {
+  border-radius: 999px;
+  background: #b94d45;
+  color: #fffaf4;
+  transition: transform 180ms ease, box-shadow 180ms ease, opacity 180ms ease, background 180ms ease;
+}
+
+.terminate-button:hover:not(:disabled) {
+  background: #a53f38;
+  box-shadow: 0 10px 22px rgba(163, 63, 56, 0.2);
+}
+
 .icon-button {
   width: 48px;
   height: 48px;
@@ -1156,6 +1168,18 @@ button:disabled {
 .stage-meta {
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.stage-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+body.theme-dark .terminate-button {
+  background: #a84646;
+  color: #fff7f2;
 }
 
 .chat-thread {

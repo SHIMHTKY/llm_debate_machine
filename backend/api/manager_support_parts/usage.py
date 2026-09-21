@@ -197,6 +197,7 @@ def rebuild_usage_tracking(
     kept_ids = {str(message.get("id") or "").strip() for message in kept_messages if str(message.get("id") or "").strip()}
     current_phase = str(rebuilt_runtime.get("phase") or "judge_initialize")
     filtered_timeline: list[dict[str, Any]] = []
+    all_timeline_usage: dict[str, Any] | None = None
 
     for entry in raw_timeline:
         if not isinstance(entry, dict):
@@ -206,6 +207,7 @@ def rebuild_usage_tracking(
         usage_delta = entry.get("usage_delta")
         if not isinstance(usage_delta, dict) or not usage_delta.get("enabled"):
             continue
+        all_timeline_usage = combine_usage_summaries(all_timeline_usage, usage_delta)
 
         include = False
         if message_id:
@@ -230,4 +232,10 @@ def rebuild_usage_tracking(
     merged_usage: dict[str, Any] | None = None
     for entry in filtered_timeline:
         merged_usage = combine_usage_summaries(merged_usage, entry.get("usage_delta"))
+
+    # A pause can happen after the model/tool has consumed tokens but before the
+    # phase emits its durable message and timeline entry. Keep that real cost in
+    # the rebuilt record without falsely attaching it to a removed message.
+    interrupted_usage = diff_usage_summaries(all_timeline_usage, current_usage) if all_timeline_usage is not None else None
+    merged_usage = combine_usage_summaries(merged_usage, interrupted_usage)
     return merged_usage

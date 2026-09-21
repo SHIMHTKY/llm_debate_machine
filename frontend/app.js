@@ -83,6 +83,8 @@ const state = {
   editingTitleSessionId: "",
   savingTitleSessionId: "",
   savingHomeBinding: false,
+  homeBindingSavePromise: null,
+  startDebateLocked: false,
   settingsSnapshot: null,
   settingsDarkModeSnapshot: false,
   settingsModalTimer: null,
@@ -154,6 +156,7 @@ function cacheElements() {
   els.reviewTopicField = document.getElementById("reviewTopicField");
   els.previewErrorBtn = document.getElementById("previewErrorBtn");
   els.stopDebateBtn = document.getElementById("stopDebateBtn");
+  els.terminateDebateBtn = document.getElementById("terminateDebateBtn");
   els.liveComposerShell = document.getElementById("liveComposerShell");
   els.userInterjectionInput = document.getElementById("userInterjectionInput");
   els.toggleUserTargetMenuBtn = document.getElementById("toggleUserTargetMenuBtn");
@@ -259,6 +262,7 @@ function bindEvents() {
   els.resultHighlights.addEventListener("click", handleEvaluationGroupClick);
   els.resultHighlights.addEventListener("keydown", handleEvaluationGroupKeydown);
   els.stopDebateBtn.addEventListener("click", stopCurrentDebate);
+  els.terminateDebateBtn?.addEventListener("click", terminateCurrentDebate);
   els.toggleUserComposerExpandBtn.addEventListener("click", toggleUserComposerExpanded);
   els.sendUserMessageBtn.addEventListener("click", sendUserInterjection);
   els.userInterjectionInput.addEventListener("keydown", handleUserInterjectionKeydown);
@@ -508,16 +512,18 @@ async function saveSettings() {
   }
 }
 
-async function persistSettings() {
-  const payload = buildSettingsPayload();
-  state.settings = await api("/api/settings", {
+async function persistSettings(payload = buildSettingsPayload(), options = {}) {
+  const savedSettings = await api("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (options.applyResult !== false) {
+    state.settings = savedSettings;
+  }
   ensurePresetManagerSelections();
   renderHomeDebaterBinding();
-  return state.settings;
+  return savedSettings;
 }
 
 function buildSettingsPayload() {
@@ -2146,19 +2152,42 @@ async function handleHomeBindingChange(event) {
   if (!(target instanceof HTMLSelectElement) || !target.dataset.bindingField || !state.settings) {
     return;
   }
-  const previousValue = state.settings[target.dataset.bindingField] || "";
-  state.settings[target.dataset.bindingField] = String(target.value || "");
+  const field = target.dataset.bindingField;
+  const previousValue = state.settings[field] || "";
+  const nextValue = String(target.value || "");
+  state.settings[field] = nextValue;
   ensureSelectedPresetEditor();
   state.savingHomeBinding = true;
+  updateStartDebateAvailability();
   renderHomeDebaterBinding();
+  const payload = buildSettingsPayload();
+  const previousSave = state.homeBindingSavePromise;
+  const savePromise = (previousSave || Promise.resolve())
+    .catch(() => null)
+    .then(() => persistSettings(payload, { applyResult: false }));
+  state.homeBindingSavePromise = savePromise;
   try {
-    await persistSettings();
+    const savedSettings = await savePromise;
+    if (state.homeBindingSavePromise === savePromise) {
+      state.settings = savedSettings;
+      ensurePresetManagerSelections();
+    }
   } catch (error) {
-    state.settings[target.dataset.bindingField] = previousValue;
-    renderHomeDebaterBinding();
-    window.alert(error?.message || "保存辩手选择失败。");
+    if (state.homeBindingSavePromise === savePromise) {
+      try {
+        state.settings = await api("/api/settings");
+        ensurePresetManagerSelections();
+      } catch {
+        state.settings[field] = previousValue;
+      }
+      window.alert(error?.message || "保存辩手选择失败。");
+    }
   } finally {
-    state.savingHomeBinding = false;
+    if (state.homeBindingSavePromise === savePromise) {
+      state.homeBindingSavePromise = null;
+      state.savingHomeBinding = false;
+    }
+    updateStartDebateAvailability();
     renderHomeDebaterBinding();
   }
 }
@@ -2923,6 +2952,15 @@ async function startDebate(event) {
     return;
   }
 
+  const pendingBindingSave = state.homeBindingSavePromise;
+  if (pendingBindingSave) {
+    try {
+      await pendingBindingSave;
+    } catch {
+      return;
+    }
+  }
+
   try {
     clearInlineError();
     cancelSessionOpenRequest();
@@ -2952,6 +2990,15 @@ async function startDebate(event) {
     setRunningState(false, "启动失败");
     showLocalError(error.message, true);
   }
+}
+
+function isCurrentSession(sessionId) {
+  const normalizedId = String(sessionId || "");
+  return Boolean(
+    normalizedId
+    && state.currentSessionId === normalizedId
+    && state.currentSession?.id === normalizedId
+  );
 }
 
 function cancelSessionOpenRequest() {
@@ -3062,7 +3109,11 @@ async function archiveSession(sessionId) {
       state.currentSession = session;
     }
     await Promise.all([loadSessions(), loadArchivedSessions()]);
-    renderCurrentSession();
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    } else {
+      renderSessions();
+    }
   } catch (error) {
     showLocalError(error.message);
   }
@@ -3075,7 +3126,11 @@ async function restoreArchivedSession(sessionId) {
       state.currentSession = session;
     }
     await Promise.all([loadSessions(), loadArchivedSessions()]);
-    renderCurrentSession();
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    } else {
+      renderSessions();
+    }
   } catch (error) {
     showLocalError(error.message);
   }
@@ -3342,21 +3397,32 @@ async function handleMessageRewindAction(messageId) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message_id: messageId, clone: mode === "clone" }),
     });
-    disconnectStream();
-    state.currentSession = nextSession;
-    state.currentSessionId = nextSession.id;
-    state.typing = null;
-    state.reviewTopicExpanded = false;
-    state.expandedEvaluationGroups = {};
-    resetUserTargetState({ clearSelection: true });
-    switchView("debate");
-    renderCurrentSession();
+    upsertSessionSummary(nextSession);
+    if (isCurrentSession(sessionId)) {
+      disconnectStream();
+      state.currentSession = nextSession;
+      state.currentSessionId = nextSession.id;
+      state.typing = null;
+      state.reviewTopicExpanded = false;
+      state.expandedEvaluationGroups = {};
+      resetUserTargetState({ clearSelection: true });
+      switchView("debate");
+      renderCurrentSession();
+    } else {
+      renderSessions();
+    }
     await Promise.all([loadSessions(), loadArchivedSessions()]);
   } catch (error) {
-    showLocalError(error.message);
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message);
+    }
   } finally {
-    state.rewindingMessageActionKey = "";
-    renderCurrentSession();
+    if (state.rewindingMessageActionKey === actionKey) {
+      state.rewindingMessageActionKey = "";
+    }
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    }
   }
 }
 
@@ -3728,24 +3794,33 @@ async function submitTitleEdit() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: nextTitle }),
     });
-    state.currentSession = nextSession;
-    state.currentSessionId = nextSession.id;
-    closeTitleEditModal();
-    renderCurrentSession();
+    upsertSessionSummary(nextSession);
+    if (isCurrentSession(sessionId)) {
+      state.currentSession = nextSession;
+      state.currentSessionId = nextSession.id;
+      closeTitleEditModal();
+      renderCurrentSession();
+    } else {
+      renderSessions();
+    }
     await Promise.all([loadSessions(), loadArchivedSessions()]);
   } catch (error) {
-    showLocalError(error.message);
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message);
+    }
   } finally {
-    state.savingTitleSessionId = "";
-    if (els.titleEditInput) {
-      els.titleEditInput.disabled = false;
-    }
-    if (els.cancelTitleEditBtn) {
-      els.cancelTitleEditBtn.disabled = false;
-    }
-    if (els.confirmTitleEditBtn) {
-      els.confirmTitleEditBtn.disabled = false;
-      els.confirmTitleEditBtn.textContent = "确认";
+    if (state.savingTitleSessionId === sessionId) {
+      state.savingTitleSessionId = "";
+      if (els.titleEditInput) {
+        els.titleEditInput.disabled = false;
+      }
+      if (els.cancelTitleEditBtn) {
+        els.cancelTitleEditBtn.disabled = false;
+      }
+      if (els.confirmTitleEditBtn) {
+        els.confirmTitleEditBtn.disabled = false;
+        els.confirmTitleEditBtn.textContent = "确认";
+      }
     }
   }
 }
@@ -3790,7 +3865,7 @@ async function stopCurrentDebate() {
   if (!sessionId || !session) {
     return;
   }
-  if (state.togglingPauseSessionId === sessionId) {
+  if (state.togglingPauseSessionId === sessionId || state.stoppingSessionId === sessionId) {
     return;
   }
   const paused = session.status === "paused";
@@ -3802,22 +3877,76 @@ async function stopCurrentDebate() {
   renderCurrentSession();
   try {
     const nextSession = await api(`/api/debates/${sessionId}/${paused ? "resume" : "pause"}`, { method: "POST" });
-    state.currentSession = nextSession;
-    state.currentSessionId = nextSession.id;
-    state.typing = isRunningSessionStatus(nextSession.status) ? nextSession.live_status || null : null;
-    if (isLiveSessionStatus(nextSession.status)) {
-      connectStream(nextSession.id, { force: true });
+    upsertSessionSummary(nextSession);
+    if (isCurrentSession(sessionId)) {
+      state.currentSession = nextSession;
+      state.currentSessionId = nextSession.id;
+      state.typing = isRunningSessionStatus(nextSession.status) ? nextSession.live_status || null : null;
+      if (isLiveSessionStatus(nextSession.status)) {
+        connectStream(nextSession.id, { force: true });
+      } else {
+        disconnectStream();
+      }
+      switchView("debate");
+      renderCurrentSession();
     } else {
-      disconnectStream();
+      renderSessions();
     }
-    switchView("debate");
-    renderCurrentSession();
     await loadSessions();
   } catch (error) {
-    showLocalError(error.message);
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message);
+    }
   } finally {
-    state.togglingPauseSessionId = "";
-    renderCurrentSession();
+    if (state.togglingPauseSessionId === sessionId) {
+      state.togglingPauseSessionId = "";
+    }
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    }
+  }
+}
+
+async function terminateCurrentDebate() {
+  const session = state.currentSession;
+  const sessionId = session?.id || state.currentSessionId;
+  if (!sessionId || !session || !isLiveSessionStatus(session.status)) {
+    return;
+  }
+  if (state.stoppingSessionId === sessionId || state.togglingPauseSessionId === sessionId) {
+    return;
+  }
+  if (!window.confirm("确认终止当前辩论吗？终止后不能继续，只能从回放中查看记录。")) {
+    return;
+  }
+
+  state.stoppingSessionId = sessionId;
+  renderCurrentSession();
+  try {
+    const nextSession = await api(`/api/debates/${sessionId}/stop`, { method: "POST" });
+    upsertSessionSummary(nextSession);
+    if (isCurrentSession(sessionId)) {
+      disconnectStream();
+      state.currentSession = nextSession;
+      state.currentSessionId = nextSession.id;
+      state.typing = null;
+      switchView("debate");
+      renderCurrentSession();
+    } else {
+      renderSessions();
+    }
+    await loadSessions();
+  } catch (error) {
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message, true);
+    }
+  } finally {
+    if (state.stoppingSessionId === sessionId) {
+      state.stoppingSessionId = "";
+    }
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    }
   }
 }
 
@@ -3851,18 +3980,29 @@ async function sendUserInterjection() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content, target_role: isTargetRole(state.userMessageTargetRole) ? state.userMessageTargetRole : null }),
     });
-    state.currentSession = nextSession;
-    state.currentSessionId = nextSession.id;
-    if (els.userInterjectionInput) {
-      els.userInterjectionInput.value = "";
+    upsertSessionSummary(nextSession);
+    if (isCurrentSession(sessionId)) {
+      state.currentSession = nextSession;
+      state.currentSessionId = nextSession.id;
+      if (els.userInterjectionInput) {
+        els.userInterjectionInput.value = "";
+      }
+      renderCurrentSession();
+    } else {
+      renderSessions();
     }
-    renderCurrentSession();
     await loadSessions();
   } catch (error) {
-    showLocalError(error.message, true);
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message, true);
+    }
   } finally {
-    state.sendingUserMessageSessionId = "";
-    renderCurrentSession();
+    if (state.sendingUserMessageSessionId === sessionId) {
+      state.sendingUserMessageSessionId = "";
+    }
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    }
   }
 }
 
@@ -3877,23 +4017,36 @@ async function retractUserInterjection() {
   try {
     const result = await api(`/api/debates/${sessionId}/user-message`, { method: "DELETE" });
     if (result?.session) {
-      state.currentSession = result.session;
-      state.currentSessionId = result.session.id;
+      upsertSessionSummary(result.session);
     }
-    resetUserTargetState();
-    state.userMessageTargetRole = isTargetRole(result?.target_role) ? result.target_role : state.userMessageTargetRole;
-    if (els.userInterjectionInput) {
-      els.userInterjectionInput.value = String(result?.content || "");
-      els.userInterjectionInput.focus();
-      els.userInterjectionInput.setSelectionRange(els.userInterjectionInput.value.length, els.userInterjectionInput.value.length);
+    if (isCurrentSession(sessionId)) {
+      if (result?.session) {
+        state.currentSession = result.session;
+        state.currentSessionId = result.session.id;
+      }
+      resetUserTargetState();
+      state.userMessageTargetRole = isTargetRole(result?.target_role) ? result.target_role : state.userMessageTargetRole;
+      if (els.userInterjectionInput) {
+        els.userInterjectionInput.value = String(result?.content || "");
+        els.userInterjectionInput.focus();
+        els.userInterjectionInput.setSelectionRange(els.userInterjectionInput.value.length, els.userInterjectionInput.value.length);
+      }
+      renderCurrentSession();
+    } else {
+      renderSessions();
     }
-    renderCurrentSession();
     await loadSessions();
   } catch (error) {
-    showLocalError(error.message, true);
+    if (isCurrentSession(sessionId)) {
+      showLocalError(error.message, true);
+    }
   } finally {
-    state.retractingUserMessageSessionId = "";
-    renderCurrentSession();
+    if (state.retractingUserMessageSessionId === sessionId) {
+      state.retractingUserMessageSessionId = "";
+    }
+    if (isCurrentSession(sessionId)) {
+      renderCurrentSession();
+    }
   }
 }
 
@@ -3923,6 +4076,7 @@ function renderLiveState(session) {
   const statusText = formatStatus(session.status || "queued");
   const isPaused = session.status === "paused";
   const isToggling = state.togglingPauseSessionId === session.id;
+  const isStopping = state.stoppingSessionId === session.id;
   const isSending = state.sendingUserMessageSessionId === session.id;
   const isRetracting = state.retractingUserMessageSessionId === session.id;
   const activeUserMessage = getActiveUserMessage(session);
@@ -3933,11 +4087,18 @@ function renderLiveState(session) {
     els.livePanelTitle.textContent = isPaused ? "辩论已暂停" : "实时辩论中";
   }
   els.sessionMeta.textContent = `${statusText} · 会话 ${session.id}`;
-  els.liveStatusBadge.textContent = isToggling ? (isPaused ? "继续中" : "暂停中") : statusText;
-  els.stopDebateBtn.disabled = isToggling;
+  els.liveStatusBadge.textContent = isStopping ? "终止中" : (isToggling ? (isPaused ? "继续中" : "暂停中") : statusText);
+  els.stopDebateBtn.disabled = isToggling || isStopping;
   els.stopDebateBtn.textContent = isToggling ? (isPaused ? "继续中..." : "暂停中...") : (isPaused ? "继续辩论" : "暂停辩论");
   els.stopDebateBtn.classList.toggle("resume-mode", isPaused && !isToggling);
-  setRunningState(isRunningSessionStatus(session.status), isToggling ? (isPaused ? "正在继续辩论..." : "正在暂停辩论...") : statusText);
+  if (els.terminateDebateBtn) {
+    els.terminateDebateBtn.disabled = isToggling || isStopping;
+    els.terminateDebateBtn.textContent = isStopping ? "终止中..." : "终止辩论";
+  }
+  const operationText = isStopping
+    ? "正在终止辩论..."
+    : (isToggling ? (isPaused ? "正在继续辩论..." : "正在暂停辩论...") : statusText);
+  setRunningState(isRunningSessionStatus(session.status), operationText);
 
   const parts = messages.map((message) => renderMessageRow(message, session, { animate: message.id === latestMessageId }));
   if (liveStatus) {
@@ -4480,8 +4641,15 @@ function switchView() {
 
 function setRunningState(isRunning, text) {
   els.runStatusBadge.textContent = text;
-  els.startDebateBtn.disabled = isRunning;
+  state.startDebateLocked = Boolean(isRunning);
+  updateStartDebateAvailability();
   renderHomeDebaterBinding();
+}
+
+function updateStartDebateAvailability() {
+  if (els.startDebateBtn) {
+    els.startDebateBtn.disabled = Boolean(state.startDebateLocked || state.savingHomeBinding);
+  }
 }
 
 function setExportButtonsEnabled(enabled) {
@@ -5094,9 +5262,15 @@ function renderDetailTextTaskBar() {
     els.detailTextTaskBar.classList.add("hidden");
     els.detailTextTaskBar.classList.remove("visible");
     els.detailTextTaskLabel.textContent = "";
+    if (els.cancelDetailTextTaskBtn) {
+      els.cancelDetailTextTaskBtn.disabled = false;
+    }
     return;
   }
   els.detailTextTaskLabel.textContent = task.label || "正在处理模型调用细节...";
+  if (els.cancelDetailTextTaskBtn) {
+    els.cancelDetailTextTaskBtn.disabled = Boolean(task.cancelling);
+  }
   els.detailTextTaskBar.classList.remove("hidden");
   window.requestAnimationFrame(() => {
     if (state.messageDetailTask === task) {
@@ -5114,18 +5288,45 @@ function clearMessageDetailTextTask(task) {
   renderDetailTextTaskBar();
 }
 
-function cancelMessageDetailTextTask() {
+async function cancelMessageDetailTextTask() {
   const task = state.messageDetailTask;
-  if (!task) {
+  if (!task || task.cancelling) {
     return;
   }
   task.cancelled = true;
-  task.controller?.abort();
+  task.cancelling = true;
+  task.label = task.view === "translation" ? "正在取消翻译请求..." : "正在取消总结请求...";
   if (task.target) {
     setActiveDetailTextView(task.target, "original");
   }
-  clearMessageDetailTextTask(task);
+  renderDetailTextTaskBar();
   rerenderMessageDetailBody();
+  try {
+    const result = await api(`/api/detail-tasks/${encodeURIComponent(task.taskId)}/cancel`, {
+      method: "POST",
+      timeoutMs: 15000,
+    });
+    if (!result?.cancelled) {
+      task.cancelled = false;
+      task.cancelling = false;
+      task.label = task.view === "translation" ? "正在翻译模型调用细节..." : "正在总结模型调用细节...";
+      renderDetailTextTaskBar();
+      return;
+    }
+    task.controller?.abort();
+    task.cancelling = false;
+    clearMessageDetailTextTask(task);
+    rerenderMessageDetailBody();
+  } catch (error) {
+    if (state.messageDetailTask !== task) {
+      return;
+    }
+    task.cancelled = false;
+    task.cancelling = false;
+    task.label = task.view === "translation" ? "正在翻译模型调用细节..." : "正在总结模型调用细节...";
+    renderDetailTextTaskBar();
+    showLocalError(error?.message || "取消请求失败，原任务仍在继续。", true);
+  }
 }
 
 function isAbortError(error) {
@@ -5163,13 +5364,16 @@ async function handleMessageDetailBodyClick(event) {
     return;
   }
   const controller = new AbortController();
+  const taskId = createDetailTaskId();
   const task = {
+    taskId,
     key: loadingKey,
     view: target.view,
     target,
     label: target.view === "translation" ? "正在翻译模型调用细节..." : "正在总结模型调用细节...",
     controller,
     cancelled: false,
+    cancelling: false,
   };
   state.messageDetailTask = task;
   state.messageDetailLoadingKey = loadingKey;
@@ -5189,8 +5393,12 @@ async function handleMessageDetailBodyClick(event) {
         content_kind: target.contentKind,
         entry_index: target.entryIndex,
         view: target.view,
+        task_id: taskId,
       }),
     });
+    if (result?.cancelled) {
+      return;
+    }
     if (result?.session) {
       if (state.currentSession?.id === sessionId) {
         state.currentSession = result.session;
@@ -5205,9 +5413,18 @@ async function handleMessageDetailBodyClick(event) {
     setActiveDetailTextView(target, "original");
     showLocalError(error?.message || "生成内容失败，请检查翻译/总结模型配置。", true);
   } finally {
-    clearMessageDetailTextTask(task);
+    if (!task.cancelling) {
+      clearMessageDetailTextTask(task);
+    }
     rerenderMessageDetailBody();
   }
+}
+
+function createDetailTaskId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `detail-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function openMessageDetails(messageId) {

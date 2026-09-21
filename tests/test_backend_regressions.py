@@ -10,13 +10,17 @@ from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from backend.api.manager import DebateRunManager
+from backend.api import app as app_module
+from backend.api.detail_views import _DETAIL_TASKS
 from backend.api.manager_parts import runtime as runtime_module
 from backend.api.manager_parts.runtime import _redact_sensitive_text
+from backend.api.manager_support_parts.usage import empty_usage_summary, rebuild_usage_tracking
 from backend.api.manager_support_parts.session_view import find_preset
-from backend.api.schemas import DebateStartRequest
+from backend.api.schemas import DebateStartRequest, MessageDetailViewRequest
 from backend.config.settings import public_settings_summary, settings_for_frontend
 from backend.config.settings_parts.constants import MASKED_SECRET
 from backend.config.settings_parts import storage as settings_storage
@@ -54,6 +58,11 @@ class StubLogger:
 
 
 class BackendRegressionTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        for task in list(_DETAIL_TASKS.values()):
+            task.cancel()
+        _DETAIL_TASKS.clear()
+
     def test_whitespace_topic_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             DebateStartRequest(topic="   ", min_rounds=2, max_rounds=3)
@@ -259,6 +268,215 @@ class BackendRegressionTests(unittest.TestCase):
     def test_message_text_supports_langchain_messages(self) -> None:
         flattened = message_text([ToolMessage(content="result", tool_call_id="call_1")])
         self.assertIn("tool: result", flattened)
+
+    def test_rebuild_usage_keeps_uncommitted_pause_cost(self) -> None:
+        committed = self._usage_summary(60)
+        removed = self._usage_summary(40)
+        current = self._usage_summary(140, call_count=3)
+        session = {
+            "usage_stats": current,
+            "runtime_state": {
+                "phase": "con_argument",
+                "debate_history": [],
+                "usage_timeline": [
+                    {"phase": "pro_argument", "message_id": "keep", "usage_delta": committed},
+                    {"phase": "con_argument", "message_id": "remove", "usage_delta": removed},
+                ],
+            },
+        }
+        rebuilt_runtime = {"phase": "con_argument"}
+
+        rebuilt = rebuild_usage_tracking(session, [{"id": "keep"}], rebuilt_runtime)
+
+        self.assertEqual(rebuilt["totals"]["total_tokens"], 100)
+        self.assertEqual(rebuilt["totals"]["call_count"], 2)
+        self.assertEqual(rebuilt["roles"]["pro"]["total_tokens"], 100)
+        self.assertEqual([entry["message_id"] for entry in rebuilt_runtime["usage_timeline"]], ["keep"])
+
+    def test_rebuild_usage_does_not_duplicate_committed_cost(self) -> None:
+        committed = self._usage_summary(60)
+        removed = self._usage_summary(40)
+        session = {
+            "usage_stats": self._usage_summary(100, call_count=2),
+            "runtime_state": {
+                "phase": "con_argument",
+                "debate_history": [],
+                "usage_timeline": [
+                    {"phase": "pro_argument", "message_id": "keep", "usage_delta": committed},
+                    {"phase": "con_argument", "message_id": "remove", "usage_delta": removed},
+                ],
+            },
+        }
+
+        rebuilt = rebuild_usage_tracking(session, [{"id": "keep"}], {"phase": "con_argument"})
+
+        self.assertEqual(rebuilt["totals"]["total_tokens"], 60)
+        self.assertEqual(rebuilt["totals"]["call_count"], 1)
+
+    @staticmethod
+    def _usage_summary(total_tokens: int, *, call_count: int = 1) -> dict:
+        summary = empty_usage_summary(enabled=True)
+        summary["roles"]["pro"].update(
+            {
+                "input_tokens": total_tokens,
+                "total_tokens": total_tokens,
+                "call_count": call_count,
+                "stages": {
+                    "argument": {
+                        "input_tokens": total_tokens,
+                        "output_tokens": 0,
+                        "total_tokens": total_tokens,
+                        "call_count": call_count,
+                        "estimated": False,
+                    }
+                },
+            }
+        )
+        summary["totals"].update({"input_tokens": total_tokens, "total_tokens": total_tokens, "call_count": call_count})
+        return summary
+
+
+class DetailTaskCancellationTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        for task in list(_DETAIL_TASKS.values()):
+            task.cancel()
+        _DETAIL_TASKS.clear()
+
+    @staticmethod
+    def _endpoint(application, path: str):
+        return next(route.endpoint for route in application.routes if getattr(route, "path", "") == path)
+
+    async def test_detail_task_cancel_reaches_model_coroutine_and_skips_write(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        wrote_cache = False
+
+        async def fake_build(*_args, **_kwargs):
+            nonlocal wrote_cache
+            started.set()
+            try:
+                await asyncio.Event().wait()
+                wrote_cache = True
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        application = app_module.create_app()
+        create_endpoint = self._endpoint(application, "/api/debates/{session_id}/message-detail-view")
+        cancel_endpoint = self._endpoint(application, "/api/detail-tasks/{task_id}/cancel")
+        payload = MessageDetailViewRequest(
+            message_id="message-1",
+            detail_index=0,
+            content_kind="reasoning",
+            entry_index=0,
+            view="summary",
+            task_id="cancel-test",
+        )
+
+        with patch.object(app_module, "build_message_detail_view", side_effect=fake_build):
+            request_task = asyncio.create_task(create_endpoint("session-1", payload))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            cancel_result = await cancel_endpoint("cancel-test")
+            response = await asyncio.wait_for(request_task, timeout=1)
+
+        self.assertTrue(cancel_result["cancelled"])
+        self.assertTrue(response["cancelled"])
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(wrote_cache)
+        self.assertEqual(_DETAIL_TASKS, {})
+
+    async def test_detail_task_rejects_concurrency_and_cleans_up(self) -> None:
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def fake_build(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return {"view": {}, "cached": False}
+
+        application = app_module.create_app()
+        create_endpoint = self._endpoint(application, "/api/debates/{session_id}/message-detail-view")
+        first_payload = MessageDetailViewRequest(
+            message_id="message-1",
+            detail_index=0,
+            content_kind="tool_result",
+            view="summary",
+            task_id="first-task",
+        )
+        second_payload = first_payload.model_copy(update={"task_id": "second-task"})
+
+        with patch.object(app_module, "build_message_detail_view", side_effect=fake_build):
+            first_request = asyncio.create_task(create_endpoint("session-1", first_payload))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            with self.assertRaises(HTTPException) as raised:
+                await create_endpoint("session-1", second_payload)
+            self.assertEqual(raised.exception.status_code, 409)
+            release.set()
+            await asyncio.wait_for(first_request, timeout=1)
+
+        self.assertEqual(_DETAIL_TASKS, {})
+
+    async def test_detail_task_exception_releases_registry(self) -> None:
+        async def fake_build(*_args, **_kwargs):
+            raise RuntimeError("model failed")
+
+        application = app_module.create_app()
+        create_endpoint = self._endpoint(application, "/api/debates/{session_id}/message-detail-view")
+        payload = MessageDetailViewRequest(
+            message_id="message-1",
+            detail_index=0,
+            content_kind="tool_result",
+            view="summary",
+            task_id="failed-task",
+        )
+
+        with patch.object(app_module, "build_message_detail_view", side_effect=fake_build):
+            with self.assertRaisesRegex(RuntimeError, "model failed"):
+                await create_endpoint("session-1", payload)
+
+        self.assertEqual(_DETAIL_TASKS, {})
+
+    async def test_client_disconnect_does_not_cancel_detail_model_task(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        model_cancelled = False
+
+        async def fake_build(*_args, **_kwargs):
+            nonlocal model_cancelled
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                model_cancelled = True
+                raise
+            return {"view": {}, "cached": False}
+
+        application = app_module.create_app()
+        create_endpoint = self._endpoint(application, "/api/debates/{session_id}/message-detail-view")
+        payload = MessageDetailViewRequest(
+            message_id="message-1",
+            detail_index=0,
+            content_kind="tool_result",
+            view="summary",
+            task_id="detached-task",
+        )
+
+        with patch.object(app_module, "build_message_detail_view", side_effect=fake_build):
+            request_task = asyncio.create_task(create_endpoint("session-1", payload))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            request_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request_task
+            self.assertIn("detached-task", _DETAIL_TASKS)
+            self.assertFalse(model_cancelled)
+            release.set()
+            for _ in range(10):
+                if not _DETAIL_TASKS:
+                    break
+                await asyncio.sleep(0)
+
+        self.assertFalse(model_cancelled)
+        self.assertEqual(_DETAIL_TASKS, {})
 
 
 class BindToolsProtocolTests(unittest.IsolatedAsyncioTestCase):
