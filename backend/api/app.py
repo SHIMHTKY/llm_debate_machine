@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config.settings import load_settings_for_frontend, save_settings_for_frontend
 from ..storage.sessions import SessionStore
+from ..storage.conversations import ConversationStore
 from .detail_views import (
     build_message_detail_view,
     cancel_detail_task,
@@ -32,7 +33,8 @@ from .detail_views import (
     unregister_detail_task,
 )
 from .manager import DebateCapacityError, DebateResumeError, DebateRunManager, DebateStateError
-from .schemas import DebateRewindRequest, DebateStartRequest, DebateTitleUpdateRequest, DebateUserMessageRequest, MessageDetailViewRequest
+from .conversation_manager import ConversationRunManager
+from .schemas import ConversationStartRequest, DebateRewindRequest, DebateStartRequest, DebateTitleUpdateRequest, DebateUserMessageRequest, MessageDetailViewRequest
 
 # 项目根目录，用来定位前端静态资源。
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -40,8 +42,10 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 
 # store 负责会话与记录落盘。
 store = SessionStore()
+conversation_store = ConversationStore()
 # manager 负责真正的运行时生命周期控制。
 manager = DebateRunManager(store)
+conversation_manager = ConversationRunManager(conversation_store)
 
 SessionId = Annotated[str, ApiPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
 DetailTaskId = Annotated[str, ApiPath(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -53,10 +57,12 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         manager.recover_interrupted_sessions()
+        conversation_manager.recover_interrupted_sessions()
         try:
             yield
         finally:
             await manager.shutdown()
+            await conversation_manager.shutdown()
 
     app = FastAPI(title="LLM Debate Studio", lifespan=lifespan)
 
@@ -323,6 +329,98 @@ def create_app() -> FastAPI:
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    @app.get("/api/conversations")
+    async def list_conversations() -> list[dict[str, Any]]:
+        return conversation_store.list_sessions()
+
+    @app.get("/api/conversations/archived")
+    async def list_archived_conversations() -> list[dict[str, Any]]:
+        return conversation_store.list_sessions(archived=True)
+
+    @app.get("/api/conversations/{session_id}")
+    async def get_conversation(session_id: SessionId) -> dict[str, Any]:
+        session = conversation_store.load_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return session
+
+    @app.post("/api/conversations")
+    async def create_conversation(payload: ConversationStartRequest) -> dict[str, Any]:
+        try:
+            return await conversation_manager.start_conversation(payload.prompt, payload.participant_preset_ids)
+        except DebateCapacityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DebateStateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/conversations/{session_id}/stop")
+    async def stop_conversation(session_id: SessionId) -> dict[str, Any]:
+        session = await conversation_manager.stop_conversation(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return session
+
+    @app.put("/api/conversations/{session_id}/title")
+    async def update_conversation_title(session_id: SessionId, payload: DebateTitleUpdateRequest) -> dict[str, Any]:
+        session = conversation_store.update_session(
+            session_id,
+            lambda current: {
+                **current,
+                "runtime_state": {
+                    **(current.get("runtime_state") if isinstance(current.get("runtime_state"), dict) else {}),
+                    "debate_title": payload.title.strip(),
+                },
+            },
+        )
+        if session is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return session
+
+    @app.post("/api/conversations/{session_id}/archive")
+    async def archive_conversation(session_id: SessionId) -> dict[str, Any]:
+        current = conversation_store.load_session(session_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        if str(current.get("status") or "") in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="进行中的自由对话不能归档，请先终止。")
+        return conversation_store.archive_session(session_id) or current
+
+    @app.post("/api/conversations/{session_id}/restore")
+    async def restore_conversation(session_id: SessionId) -> dict[str, Any]:
+        session = conversation_store.restore_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return session
+
+    @app.delete("/api/conversations/{session_id}")
+    async def delete_conversation(session_id: SessionId) -> dict[str, bool]:
+        if conversation_store.load_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        if conversation_manager.is_running(session_id):
+            await conversation_manager.stop_conversation(session_id)
+        if not conversation_store.delete_session(session_id):
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return {"deleted": True}
+
+    @app.get("/api/conversations/{session_id}/export/{kind}")
+    async def export_conversation(session_id: SessionId, kind: str) -> Response:
+        if kind not in {"simple", "detail"}:
+            raise HTTPException(status_code=400, detail="导出类型仅支持 simple 或 detail。")
+        exported = conversation_store.export_session_markdown(session_id, kind)
+        if exported is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return Response(content=exported["content"], media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=\"{exported['filename']}\""})
+
+    @app.get("/api/conversations/{session_id}/events")
+    async def stream_conversation_events(session_id: SessionId):
+        if conversation_store.load_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="未找到该自由对话记录。")
+        return StreamingResponse(
+            conversation_manager.event_stream(session_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/api/records")

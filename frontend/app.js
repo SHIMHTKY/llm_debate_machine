@@ -111,6 +111,8 @@ const state = {
   userTargetSubmenuCloseTimer: null,
   userComposerDisabled: false,
   currentDebateMode: "",
+  startMode: "debate",
+  conversationParticipants: [],
   presetManagerEntering: false,
 };
 
@@ -146,8 +148,12 @@ function cacheElements() {
   els.reviewThread = document.getElementById("reviewThread");
   els.currentHeadline = document.getElementById("currentHeadline");
   els.livePanelTitle = document.getElementById("livePanelTitle");
+  els.livePanelEyebrow = document.getElementById("livePanelEyebrow");
   els.sessionMeta = document.getElementById("sessionMeta");
   els.reviewMeta = document.getElementById("reviewMeta");
+  els.reviewPanelEyebrow = document.getElementById("reviewPanelEyebrow");
+  els.reviewPanelTitle = document.getElementById("reviewPanelTitle");
+  els.reviewTranscriptTitle = document.getElementById("reviewTranscriptTitle");
   els.runStatusBadge = document.getElementById("runStatusBadge");
   els.liveStatusBadge = document.getElementById("liveStatusBadge");
   els.reviewStatusBadge = document.getElementById("reviewStatusBadge");
@@ -179,6 +185,14 @@ function cacheElements() {
   els.maxRoundsInput = document.getElementById("maxRoundsInput");
   els.startDebateBtn = document.getElementById("startDebateBtn");
   els.debateForm = document.getElementById("debateForm");
+  els.startPanelTitle = document.getElementById("startPanelTitle");
+  els.startModeSwitcher = document.getElementById("startModeSwitcher");
+  els.debateTopicField = document.getElementById("debateTopicField");
+  els.debateRoundFields = document.getElementById("debateRoundFields");
+  els.conversationStartFields = document.getElementById("conversationStartFields");
+  els.conversationPromptInput = document.getElementById("conversationPromptInput");
+  els.conversationParticipantList = document.getElementById("conversationParticipantList");
+  els.addConversationParticipantBtn = document.getElementById("addConversationParticipantBtn");
   els.settingsModal = document.getElementById("settingsModal");
   els.archivedModal = document.getElementById("archivedModal");
   els.markdownPreviewModal = document.getElementById("markdownPreviewModal");
@@ -220,6 +234,10 @@ function cacheElements() {
 
 function bindEvents() {
   els.debateForm.addEventListener("submit", startDebate);
+  els.startModeSwitcher?.addEventListener("click", handleStartModeClick);
+  els.addConversationParticipantBtn?.addEventListener("click", addConversationParticipant);
+  els.conversationParticipantList?.addEventListener("change", handleConversationParticipantChange);
+  els.conversationParticipantList?.addEventListener("click", handleConversationParticipantClick);
   els.homeDebaterBinding?.addEventListener("change", handleHomeBindingChange);
   els.homeDebaterBinding?.addEventListener("click", handleHomeBindingClick);
   document.getElementById("settingsBtn").addEventListener("click", openSettings);
@@ -2692,7 +2710,8 @@ function deleteSelectedPreset() {
 }
 async function loadSessions() {
   const requestId = ++state.sessionListRequestId;
-  const sessions = await api("/api/debates");
+  const [debates, conversations] = await Promise.all([api("/api/debates"), api("/api/conversations")]);
+  const sessions = [...debates, ...conversations].sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
   if (requestId !== state.sessionListRequestId) {
     return false;
   }
@@ -2753,6 +2772,7 @@ function buildSessionSummary(session, previous = {}) {
   return {
     ...previous,
     id: session?.id || previous?.id,
+    kind: session?.kind || previous?.kind || "debate",
     topic: getSessionDisplayTitle(session, previous?.topic),
     status: session?.status || previous?.status || "",
     created_at: session?.created_at || previous?.created_at || "",
@@ -2819,8 +2839,101 @@ async function refreshSessionSummaries() {
 }
 
 async function loadArchivedSessions() {
-  state.archivedSessions = await api("/api/debates/archived");
+  const [debates, conversations] = await Promise.all([api("/api/debates/archived"), api("/api/conversations/archived")]);
+  state.archivedSessions = [...debates, ...conversations].sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
   renderArchivedSessions();
+}
+
+function isConversationSession(session) {
+  return String(session?.kind || "debate") === "conversation";
+}
+
+function sessionApiRoot(sessionOrKind) {
+  const value = typeof sessionOrKind === "object" ? sessionOrKind : { kind: sessionOrKind };
+  return isConversationSession(value) ? "/api/conversations" : "/api/debates";
+}
+
+function sessionApiPath(sessionOrId, suffix = "") {
+  const session = typeof sessionOrId === "object" ? sessionOrId : (state.currentSession?.id === sessionOrId ? state.currentSession : { id: sessionOrId });
+  return sessionApiRoot(session) + "/" + encodeURIComponent(session.id) + suffix;
+}
+
+function sessionKindLabel(session) {
+  return isConversationSession(session) ? "对话" : "辩论";
+}
+
+function renderConversationParticipantOptions(selectedId) {
+  return getDebaterPresets().map((preset) => {
+    const selected = String(preset.id) === String(selectedId) ? " selected" : "";
+    return "<option value=\"" + escapeAttribute(preset.id) + "\"" + selected + ">" + escapeHtml(preset.name || preset.model || "未命名模型") + "</option>";
+  }).join("");
+}
+
+function renderConversationParticipants() {
+  if (!els.conversationParticipantList) return;
+  const presets = getDebaterPresets();
+  if (!state.conversationParticipants.length && presets.length) {
+    state.conversationParticipants = [presets[0].id, presets[Math.min(1, presets.length - 1)].id];
+  }
+  els.conversationParticipantList.innerHTML = state.conversationParticipants.map((presetId, index) => {
+    return "<div class=\"conversation-participant-row\">"
+      + "<span class=\"conversation-participant-index\">" + (index + 1) + "</span>"
+      + "<select data-conversation-index=\"" + index + "\" aria-label=\"第 " + (index + 1) + " 个模型\">" + renderConversationParticipantOptions(presetId) + "</select>"
+      + "<button class=\"ghost-button compact-button\" type=\"button\" data-action=\"conversation-move-up\" data-index=\"" + index + "\"" + (index === 0 ? " disabled" : "") + ">↑</button>"
+      + "<button class=\"ghost-button compact-button\" type=\"button\" data-action=\"conversation-move-down\" data-index=\"" + index + "\"" + (index === state.conversationParticipants.length - 1 ? " disabled" : "") + ">↓</button>"
+      + "<button class=\"danger-button compact-button\" type=\"button\" data-action=\"conversation-remove\" data-index=\"" + index + "\"" + (state.conversationParticipants.length <= 2 ? " disabled" : "") + ">删除</button>"
+      + "</div>";
+  }).join("");
+}
+
+function renderStartMode() {
+  const conversation = state.startMode === "conversation";
+  els.startPanelTitle.textContent = conversation ? "自由对话参数" : "辩题参数";
+  els.debateTopicField.classList.toggle("hidden", conversation);
+  els.homeDebaterBinding.classList.toggle("hidden", conversation);
+  els.debateRoundFields.classList.toggle("hidden", conversation);
+  els.conversationStartFields.classList.toggle("hidden", !conversation);
+  els.startDebateBtn.textContent = conversation ? "开始对话" : "开始辩论";
+  els.startModeSwitcher.querySelectorAll("[data-start-mode]").forEach((button) => {
+    const active = button.dataset.startMode === state.startMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  if (conversation) renderConversationParticipants();
+}
+
+function handleStartModeClick(event) {
+  const button = event.target.closest("[data-start-mode]");
+  if (!button || state.startDebateLocked) return;
+  state.startMode = button.dataset.startMode === "conversation" ? "conversation" : "debate";
+  renderStartMode();
+}
+
+function addConversationParticipant() {
+  if (state.conversationParticipants.length >= 6) {
+    window.alert("最多只能添加六个模型。");
+    return;
+  }
+  const presets = getDebaterPresets();
+  state.conversationParticipants.push(presets[state.conversationParticipants.length % Math.max(1, presets.length)]?.id || "");
+  renderConversationParticipants();
+}
+
+function handleConversationParticipantChange(event) {
+  const select = event.target.closest("[data-conversation-index]");
+  if (!select) return;
+  state.conversationParticipants[Number(select.dataset.conversationIndex)] = select.value;
+}
+
+function handleConversationParticipantClick(event) {
+  const button = event.target.closest("[data-action]");
+  if (!button) return;
+  const index = Number(button.dataset.index);
+  const action = button.dataset.action;
+  if (action === "conversation-remove" && state.conversationParticipants.length > 2) state.conversationParticipants.splice(index, 1);
+  if (action === "conversation-move-up" && index > 0) [state.conversationParticipants[index - 1], state.conversationParticipants[index]] = [state.conversationParticipants[index], state.conversationParticipants[index - 1]];
+  if (action === "conversation-move-down" && index < state.conversationParticipants.length - 1) [state.conversationParticipants[index + 1], state.conversationParticipants[index]] = [state.conversationParticipants[index], state.conversationParticipants[index + 1]];
+  renderConversationParticipants();
 }
 
 function getTrashIconSvg() {
@@ -2878,7 +2991,7 @@ function renderSessions() {
       return `
         <div class="history-item ${active}" data-session-id="${session.id}">
           <div class="history-main" title="${escapeAttribute(session.topic)}">
-            <p class="history-title" title="${escapeAttribute(session.topic)}">${escapeHtml(session.topic)}</p>
+            <p class="history-title" title="${escapeAttribute(session.topic)}"><span class="history-kind-badge">${sessionKindLabel(session)}</span>${escapeHtml(session.topic)}</p>
             <div class="history-meta">
               <div title="${escapeAttribute(meta)}">${escapeHtml(meta)}</div>
               <div title="${escapeAttribute(preview)}">${escapeHtml(preview)}</div>
@@ -2911,7 +3024,7 @@ function renderArchivedSessions() {
       return `
         <article class="archived-item">
           <div class="archived-main">
-            <p class="history-title" title="${escapeAttribute(session.topic)}">${escapeHtml(session.topic)}</p>
+            <p class="history-title" title="${escapeAttribute(session.topic)}"><span class="history-kind-badge">${sessionKindLabel(session)}</span>${escapeHtml(session.topic)}</p>
             <div class="history-meta archived-meta">
               <div title="${escapeAttribute(meta)}">${escapeHtml(meta)}</div>
               <div title="${escapeAttribute(archivedAt)}">${escapeHtml(archivedAt)}</div>
@@ -2930,6 +3043,10 @@ function renderArchivedSessions() {
 
 async function startDebate(event) {
   event.preventDefault();
+  if (state.startMode === "conversation") {
+    await startConversation();
+    return;
+  }
   const topic = els.topicInput.value.trim();
   const minRounds = Number(els.minRoundsInput.value || 0);
   const maxRounds = Number(els.maxRoundsInput.value || 0);
@@ -2992,6 +3109,43 @@ async function startDebate(event) {
   }
 }
 
+async function startConversation() {
+  const prompt = String(els.conversationPromptInput?.value || "").trim();
+  const participantPresetIds = state.conversationParticipants.map((item) => String(item || "").trim()).filter(Boolean);
+  if (!prompt) {
+    showLocalError("请先输入初始提示词。", true);
+    return;
+  }
+  if (participantPresetIds.length < 2) {
+    showLocalError("至少需要选择两个模型。", true);
+    return;
+  }
+  try {
+    clearInlineError();
+    cancelSessionOpenRequest();
+    disconnectStream();
+    setRunningState(true, "正在创建会话...");
+    const session = await api("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, participant_preset_ids: participantPresetIds }),
+    });
+    state.currentSession = { ...session, messages: [] };
+    state.currentSessionId = session.id;
+    state.reviewTopicExpanded = false;
+    state.expandedEvaluationGroups = {};
+    resetUserTargetState({ clearSelection: true });
+    state.typing = { role: "system", label: "系统", content: "模型自由对话即将开始..." };
+    switchView("debate");
+    renderCurrentSession();
+    connectStream(session.id);
+    await loadSessions();
+  } catch (error) {
+    setRunningState(false, error?.status === 409 ? "已到上限" : "启动失败");
+    showLocalError(error.message, true);
+  }
+}
+
 function isCurrentSession(sessionId) {
   const normalizedId = String(sessionId || "");
   return Boolean(
@@ -3008,11 +3162,17 @@ function cancelSessionOpenRequest() {
 }
 
 async function fetchSession(sessionId, options = {}) {
-  const session = await api(`/api/debates/${sessionId}`, { signal: options.signal });
-  if (session?.status === "error") {
+  const known = findKnownSession(sessionId);
+  const session = await api(sessionApiPath(known || { id: sessionId }), { signal: options.signal });
+  if (session?.status === "error" && !isConversationSession(session)) {
     await hydrateErrorDetails(session, options);
   }
   return session;
+}
+
+function findKnownSession(sessionId) {
+  const id = String(sessionId || "");
+  return [state.currentSession, ...(state.sessions || []), ...(state.archivedSessions || [])].find((item) => String(item?.id || "") === id) || null;
 }
 
 async function hydrateErrorDetails(session, options = {}) {
@@ -3104,7 +3264,7 @@ function closeArchivedModal() {
 
 async function archiveSession(sessionId) {
   try {
-    const session = await api(`/api/debates/${sessionId}/archive`, { method: "POST" });
+    const session = await api(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }, "/archive"), { method: "POST" });
     if (state.currentSessionId === sessionId && state.currentSession) {
       state.currentSession = session;
     }
@@ -3121,7 +3281,7 @@ async function archiveSession(sessionId) {
 
 async function restoreArchivedSession(sessionId) {
   try {
-    const session = await api(`/api/debates/${sessionId}/restore`, { method: "POST" });
+    const session = await api(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }, "/restore"), { method: "POST" });
     if (state.currentSessionId === sessionId && state.currentSession) {
       state.currentSession = session;
     }
@@ -3142,7 +3302,7 @@ async function deleteSession(sessionId, options = {}) {
     return;
   }
   try {
-    await api(`/api/debates/${sessionId}`, { method: "DELETE" });
+    await api(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }), { method: "DELETE" });
     if (state.currentSessionId === sessionId) {
       disconnectStream();
       state.currentSession = null;
@@ -3168,7 +3328,7 @@ function connectStream(sessionId, options = {}) {
   }
   clearStreamReconnectTimer();
   disconnectStream();
-  const source = new EventSource(`/api/debates/${sessionId}/events`);
+  const source = new EventSource(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }, "/events"));
   state.eventSource = source;
   state.eventSourceSessionId = sessionId;
   source.onopen = () => {
@@ -3789,7 +3949,7 @@ async function submitTitleEdit() {
     els.confirmTitleEditBtn.textContent = "保存中...";
   }
   try {
-    const nextSession = await api(`/api/debates/${sessionId}/title`, {
+    const nextSession = await api(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }, "/title"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: nextTitle }),
@@ -3865,6 +4025,9 @@ async function stopCurrentDebate() {
   if (!sessionId || !session) {
     return;
   }
+  if (isConversationSession(session)) {
+    return;
+  }
   if (state.togglingPauseSessionId === sessionId || state.stoppingSessionId === sessionId) {
     return;
   }
@@ -3916,14 +4079,15 @@ async function terminateCurrentDebate() {
   if (state.stoppingSessionId === sessionId || state.togglingPauseSessionId === sessionId) {
     return;
   }
-  if (!window.confirm("确认终止当前辩论吗？终止后不能继续，只能从回放中查看记录。")) {
+  const conversation = isConversationSession(session);
+  if (!window.confirm(conversation ? "确认终止当前模型自由对话吗？" : "确认终止当前辩论吗？终止后不能继续，只能从回放中查看记录。")) {
     return;
   }
 
   state.stoppingSessionId = sessionId;
   renderCurrentSession();
   try {
-    const nextSession = await api(`/api/debates/${sessionId}/stop`, { method: "POST" });
+    const nextSession = await api(sessionApiPath(session, "/stop"), { method: "POST" });
     upsertSessionSummary(nextSession);
     if (isCurrentSession(sessionId)) {
       disconnectStream();
@@ -4051,7 +4215,7 @@ async function retractUserInterjection() {
 }
 
 function renderLandingState() {
-  setHeadline("开始一场新的模型辩论");
+  setHeadline(state.startMode === "conversation" ? "开始一场新的模型自由对话" : "开始一场新的模型辩论");
   setRunningState(false, "空闲中");
   setExportButtonsEnabled(false);
   state.togglingPauseSessionId = "";
@@ -4073,6 +4237,7 @@ function renderWorkspace() {
 function renderLiveState(session) {
   setHeadline(getSessionDisplayTitle(session, session.topic, { placeholderDuringJudge: true }));
   setExportButtonsEnabled(false);
+  const conversation = isConversationSession(session);
   const statusText = formatStatus(session.status || "queued");
   const isPaused = session.status === "paused";
   const isToggling = state.togglingPauseSessionId === session.id;
@@ -4084,16 +4249,17 @@ function renderLiveState(session) {
   const messages = [...(session.messages || [])];
   const latestMessageId = messages.length ? messages[messages.length - 1].id : "";
   if (els.livePanelTitle) {
-    els.livePanelTitle.textContent = isPaused ? "辩论已暂停" : "实时辩论中";
+    els.livePanelTitle.textContent = conversation ? "模型自由对话中" : (isPaused ? "辩论已暂停" : "实时辩论中");
   }
+  if (els.livePanelEyebrow) els.livePanelEyebrow.textContent = conversation ? "Live Conversation" : "Live Debate";
   els.sessionMeta.textContent = `${statusText} · 会话 ${session.id}`;
   els.liveStatusBadge.textContent = isStopping ? "终止中" : (isToggling ? (isPaused ? "继续中" : "暂停中") : statusText);
-  els.stopDebateBtn.disabled = isToggling || isStopping;
-  els.stopDebateBtn.textContent = isToggling ? (isPaused ? "继续中..." : "暂停中...") : (isPaused ? "继续辩论" : "暂停辩论");
+  els.stopDebateBtn.disabled = conversation || isToggling || isStopping;
+  els.stopDebateBtn.textContent = conversation ? "自由对话运行中" : (isToggling ? (isPaused ? "继续中..." : "暂停中...") : (isPaused ? "继续辩论" : "暂停辩论"));
   els.stopDebateBtn.classList.toggle("resume-mode", isPaused && !isToggling);
   if (els.terminateDebateBtn) {
     els.terminateDebateBtn.disabled = isToggling || isStopping;
-    els.terminateDebateBtn.textContent = isStopping ? "终止中..." : "终止辩论";
+    els.terminateDebateBtn.textContent = isStopping ? "终止中..." : (conversation ? "终止对话" : "终止辩论");
   }
   const operationText = isStopping
     ? "正在终止辩论..."
@@ -4109,14 +4275,19 @@ function renderLiveState(session) {
   }
   els.chatThread.innerHTML = parts.join("");
   scrollThreadToBottom(els.chatThread, true);
-  renderQueuedUserMessage(activeUserMessage, { disabled: isRetracting });
-  renderUserComposer(session, {
-    isPaused,
-    isSending,
-    isToggling,
-    isRetracting,
-    activeUserMessage,
-  });
+  if (conversation) {
+    if (els.liveComposerShell) els.liveComposerShell.classList.add("hidden");
+  } else {
+    if (els.liveComposerShell) els.liveComposerShell.classList.remove("hidden");
+    renderQueuedUserMessage(activeUserMessage, { disabled: isRetracting });
+    renderUserComposer(session, {
+      isPaused,
+      isSending,
+      isToggling,
+      isRetracting,
+      activeUserMessage,
+    });
+  }
 }
 
 function renderQueuedUserMessage(activeUserMessage, options = {}) {
@@ -4260,6 +4431,13 @@ function renderUserComposer(session, options = {}) {
 function renderReviewState(session) {
   setHeadline(getSessionDisplayTitle(session, session.topic));
   setExportButtonsEnabled(Boolean(session?.id));
+  if (isConversationSession(session)) {
+    renderConversationReviewState(session);
+    return;
+  }
+  if (els.reviewPanelEyebrow) els.reviewPanelEyebrow.textContent = "Review";
+  if (els.reviewPanelTitle) els.reviewPanelTitle.textContent = "辩论结果回看";
+  if (els.reviewTranscriptTitle) els.reviewTranscriptTitle.textContent = "辩论回放";
   const statusText = formatStatus(session.status || "completed");
   els.reviewMeta.textContent = `${statusText} · 会话 ${session.id}`;
   els.reviewStatusBadge.textContent = statusText;
@@ -4314,6 +4492,32 @@ function renderReviewState(session) {
   els.reviewThread.scrollTop = 0;
 }
 
+function renderConversationReviewState(session) {
+  const statusText = formatStatus(session.status || "completed");
+  els.reviewMeta.textContent = statusText + " · 自由对话 " + session.id;
+  els.reviewStatusBadge.textContent = statusText;
+  if (els.reviewPanelEyebrow) els.reviewPanelEyebrow.textContent = "Conversation Review";
+  if (els.reviewPanelTitle) els.reviewPanelTitle.textContent = "自由对话回看";
+  if (els.reviewTranscriptTitle) els.reviewTranscriptTitle.textContent = "对话记录";
+  renderReviewErrorAction({ ...session, error_message: "", error_traceback: "" });
+  if (els.toggleReviewTopicBtn) els.toggleReviewTopicBtn.textContent = state.reviewTopicExpanded ? "收起提示词" : "查看提示词";
+  if (els.reviewTopicField) els.reviewTopicField.textContent = session.topic || session.prompt || "";
+  if (els.reviewTopicDisclosure) els.reviewTopicDisclosure.classList.toggle("hidden", !state.reviewTopicExpanded);
+  els.resultWinner.textContent = session.status === "error" ? "模型自由对话中断" : (session.status === "terminated" ? "模型自由对话已终止" : "模型自由对话完成");
+  const participants = Array.isArray(session.participants) ? session.participants : [];
+  els.resultScores.innerHTML = participants.map((participant, index) => renderScoreCard("模型 " + (index + 1) + " · " + (participant.name || participant.model || "未命名"), "已接力")).join("");
+  els.resultHighlights.innerHTML = "";
+  els.resultConclusion.textContent = session.error_message || session.termination_message || "模型已按顺序完成自由对话接力。";
+  els.resultConclusion.classList.toggle("error-detail", session.status === "error");
+  els.resultErrorBox.classList.toggle("hidden", session.status !== "error");
+  els.resultErrorBox.textContent = session.status === "error" ? (session.error_traceback || "") : "";
+  renderUsageSummary(session);
+  const messages = [...(session.messages || [])];
+  els.reviewThread.innerHTML = messages.length ? messages.map((message) => renderMessageRow(message, session)).join("") : '<div class="empty-state">这场自由对话没有留下可展示的消息记录。</div>';
+  els.reviewThread.scrollTop = 0;
+  setRunningState(false, statusText);
+}
+
 function renderReviewTopicPopover(session) {
   const originalTopic = getOriginalTopicText(session);
   const canShowOriginalTopic = Boolean(originalTopic);
@@ -4348,16 +4552,16 @@ function renderUsageSummary(session) {
   }
   const usageStats = session?.usage_stats;
   const roles = usageStats?.roles;
-  if (!usageStats?.enabled || !roles) {
+  const participants = usageStats?.participants;
+  if (!usageStats?.enabled || (!roles && !participants)) {
     els.resultUsage.innerHTML = "";
     els.resultUsage.classList.add("hidden");
     return;
   }
 
-  els.resultUsage.innerHTML = [
-    renderUsageCard("正方", roles.pro || {}),
-    renderUsageCard("反方", roles.con || {}),
-  ].join("");
+  els.resultUsage.innerHTML = Array.isArray(participants)
+    ? participants.map((item) => renderUsageCard(item.label || "模型", item)).join("")
+    : [renderUsageCard("正方", roles.pro || {}), renderUsageCard("反方", roles.con || {})].join("");
   els.resultUsage.classList.remove("hidden");
 }
 
@@ -4462,6 +4666,10 @@ function getRoleDisplayLabel(messageOrStatus, session) {
     return "用户发言";
   }
   const baseLabel = messageOrStatus?.label || ROLE_LABELS[role] || "系统";
+  if (role === "participant") {
+    const index = Number(messageOrStatus?.speaker_index);
+    return Number.isFinite(index) ? "模型 " + (index + 1) + " · " + baseLabel : baseLabel;
+  }
   if (!["pro", "con"].includes(role)) {
     return baseLabel;
   }
@@ -4484,6 +4692,9 @@ function renderMessageRow(message, session, options = {}) {
   } else if (message.role === "judge") {
     position = "center";
     variant = "summary judge";
+  } else if (message.role === "participant") {
+    position = Number(message.speaker_index || 0) % 2 === 0 ? "left" : "right";
+    variant = Number(message.speaker_index || 0) % 2 === 0 ? "participant participant-a" : "participant participant-b";
   } else if (message.type === "error") {
     variant = "error";
   }
@@ -4501,7 +4712,7 @@ function renderMessageRow(message, session, options = {}) {
   const inlineTimestampText = (message.role === "user" || message.role === "judge") && timestampParts
     ? [timestampParts.major, timestampParts.minor].filter(Boolean).join(" ")
     : "";
-  const rewindMode = getMessageRewindMode(session, message);
+  const rewindMode = isConversationSession(session) ? "" : getMessageRewindMode(session, message);
   const rewindActionKey = buildMessageActionKey(session?.id || state.currentSessionId, message?.id, rewindMode);
   const rewinding = rewindMode && state.rewindingMessageActionKey === rewindActionKey;
   const canShowDetails = ["pro", "con"].includes(String(message.role || "")) && hasMessageDetails(message);
@@ -4676,7 +4887,7 @@ function parseDownloadFilename(disposition) {
 }
 
 async function fetchSessionExportMarkdown(sessionId, kind, options = {}) {
-  const response = await fetchWithTimeout(`/api/debates/${encodeURIComponent(sessionId)}/export/${encodeURIComponent(kind)}`, {
+  const response = await fetchWithTimeout(sessionApiPath(findKnownSession(sessionId) || { id: sessionId }, "/export/" + encodeURIComponent(kind)), {
     signal: options.signal,
     timeoutMs: EXPORT_API_TIMEOUT_MS,
   });

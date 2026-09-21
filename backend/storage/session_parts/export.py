@@ -24,6 +24,10 @@ class SessionExportMixin:
         model_name = str(config.get("model") or config.get("azure_deployment") or "").strip()
         return f"{fallback} · {model_name}" if model_name else fallback
 
+    def _conversation_participants(self, session: dict) -> list[dict]:
+        participants = session.get("participants")
+        return participants if isinstance(participants, list) else []
+
     def _user_target_badge(self, target_role: str | None) -> str:
         role = str(target_role or "").strip().lower()
         if role == "pro":
@@ -84,6 +88,39 @@ class SessionExportMixin:
             f"- 最少轮数：{session.get('min_rounds') or '--'}",
             f"- 最多轮数：{session.get('max_rounds') or '--'}",
         ]
+
+        if str(session.get("kind") or "debate") == "conversation":
+            lines = [
+                f"# 模型自由对话·{display_title or '记录查看'}",
+                "",
+                f"- 会话 ID：{session.get('id', '')}",
+                f"- 标题：{display_title}",
+                f"- 状态：{status}",
+                f"- 开始时间：{session.get('created_at') or '--'}",
+                f"- 结束时间：{session.get('finished_at') or '--'}",
+                "",
+                "## 初始提示词",
+                "",
+                str(session.get("topic") or "").strip(),
+                "",
+                "## 模型链路",
+                "",
+            ]
+            for index, participant in enumerate(self._conversation_participants(session), start=1):
+                label = str(participant.get("name") or participant.get("model") or f"模型 {index}")
+                lines.append(f"{index}. {label}")
+            if status == "error":
+                lines.extend(["", "## 错误信息", "", str(session.get("error_message") or "未提供错误信息。")])
+            elif status == "terminated":
+                lines.extend(["", "## 终止说明", "", str(session.get("termination_message") or "用户手动终止。")])
+            self._append_conversation_usage_lines(lines, session.get("usage_stats"))
+            messages = [item for item in (session.get("messages") or []) if item.get("type") != "status"]
+            if messages:
+                lines.extend(["", "## 对话记录", ""])
+                for message in messages:
+                    label = str(message.get("label") or message.get("role") or "模型")
+                    lines.extend([f"### {label}", "", str(message.get("content") or "（空）").strip(), ""])
+            return "\n".join(lines).strip() + "\n"
 
         config_summary = session.get("config_summary") or {}
         if isinstance(config_summary, dict) and config_summary:
@@ -162,6 +199,21 @@ class SessionExportMixin:
                 lines.extend([f"### {heading}", "", str(message.get("content") or "（空）").strip(), ""])
 
         return "\n".join(lines).strip() + "\n"
+
+    def _append_conversation_usage_lines(self, lines: list[str], usage_stats: dict | None) -> None:
+        if not isinstance(usage_stats, dict) or not usage_stats.get("enabled"):
+            return
+        lines.extend(["", "## Token 统计", ""])
+        participants = usage_stats.get("participants") if isinstance(usage_stats.get("participants"), list) else []
+        for participant in participants:
+            lines.extend([
+                f"### {participant.get('label') or '模型'}",
+                "",
+                f"- 总 Token：{participant.get('total_tokens', 0)}（{'估算' if participant.get('estimated') else '实际'}）",
+                f"- 输入 Token：{participant.get('input_tokens', 0)}",
+                f"- 输出 Token：{participant.get('output_tokens', 0)}",
+                "",
+            ])
 
     def _detail_export_markdown(self, session: dict) -> str:
         """导出 detail 日志 + error 日志的组合版本。"""

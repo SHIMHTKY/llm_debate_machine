@@ -19,9 +19,13 @@ class SessionDataMixin:
         max_rounds: int,
         config_summary: dict[str, Any],
         runtime_settings: dict[str, Any] | None = None,
+        *,
+        kind: str = "debate",
+        id_prefix: str = "",
     ) -> dict[str, Any]:
-        session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        session_id = f"{id_prefix}{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         session = {
+            "kind": kind,
             "id": session_id,
             "topic": topic,
             "min_rounds": min_rounds,
@@ -75,7 +79,7 @@ class SessionDataMixin:
                 return self._write_session(normalized)
             return normalized
 
-    def list_sessions(self, archived: bool = False) -> list[dict[str, Any]]:
+    def list_sessions(self, archived: bool = False, *, kind: str = "debate") -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
         with self._lock:
             for path in self.session_dir.glob("*.json"):
@@ -87,6 +91,8 @@ class SessionDataMixin:
                     continue
                 session = self._normalize_session(payload)
                 if bool(session.get("archived")) != archived:
+                    continue
+                if str(session.get("kind") or "debate") != kind:
                     continue
                 sessions.append(session)
         sessions.sort(key=lambda item: item.get("created_at", ""), reverse=True)
@@ -107,6 +113,7 @@ class SessionDataMixin:
             preview = str(messages[-1].get("content", ""))[:120]
         result = session.get("result") or {}
         return {
+            "kind": str(session.get("kind") or "debate"),
             "id": session.get("id"),
             "topic": display_topic,
             "status": session.get("status"),

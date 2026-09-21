@@ -36,6 +36,8 @@ from backend.config.settings_parts.normalize import (
     normalize_settings,
 )
 from backend.debate.pipeline.agent import find_tool, normalize_tool_args, run_bind_tools_mode, run_manual_flow
+from backend.conversation.engine import build_conversation_runtime, build_turn_messages
+from backend.storage.conversations import ConversationStore
 from backend.debate.pipeline.common import message_text
 from backend.debate.pipeline.phases_judge import _evaluation, _score, _winner
 from backend.storage.sessions import SessionStore
@@ -130,6 +132,34 @@ class BackendRegressionTests(unittest.TestCase):
             self.assertEqual(list(store.session_dir.glob("*.tmp")), [])
             with self.assertRaises(ValueError):
                 store.load_session("../outside")
+
+    def test_conversation_turn_carries_prompt_and_previous_output(self) -> None:
+        first = build_turn_messages("讨论 AI", "", "")
+        next_turn = build_turn_messages("讨论 AI", "上一位的回答", "模型 A")
+        self.assertIn("讨论 AI", first[-1]["content"])
+        self.assertIn("讨论 AI", next_turn[-1]["content"])
+        self.assertIn("上一位的回答", next_turn[-1]["content"])
+        self.assertIn("模型 A", next_turn[-1]["content"])
+
+    def test_conversation_runtime_starts_at_first_participant(self) -> None:
+        runtime = build_conversation_runtime("topic", [{"name": "A"}, {"name": "B"}])
+        self.assertEqual(runtime["phase"], "running")
+        self.assertEqual(runtime["participant_index"], 0)
+        self.assertEqual(runtime["participant_count"], 2)
+
+    def test_conversation_store_uses_isolated_directory_and_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(base_dir=Path(temp_dir))
+            session = store.create_conversation(
+                "topic",
+                [{"name": "A"}, {"name": "B"}],
+                {"participants": [{"name": "A"}, {"name": "B"}]},
+                {"participants": []},
+            )
+            self.assertEqual(session["kind"], "conversation")
+            self.assertTrue(session["id"].startswith("conversation_"))
+            self.assertTrue(store.session_dir.name == "conversations")
+            self.assertEqual(store.list_sessions()[0]["kind"], "conversation")
 
     def test_interrupted_running_session_becomes_paused(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -25,6 +25,29 @@ class DebateStartRequest(BaseModel):
         return self
 
 
+class ConversationStartRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    participant_preset_ids: list[str] = Field(min_length=2, max_length=6)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("对话提示词不能为空。")
+        return cleaned
+
+    @field_validator("participant_preset_ids")
+    @classmethod
+    def validate_participant_preset_ids(cls, value: list[str]) -> list[str]:
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        if len(cleaned) < 2:
+            raise ValueError("至少需要选择两个模型。")
+        if len(cleaned) > 6:
+            raise ValueError("最多只能选择六个模型。")
+        return cleaned
+
+
 class DebateUserMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     target_role: Literal["pro", "con"] | None = None

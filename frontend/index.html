@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Debate Studio</title>
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=20260326-favicon" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260821-medium-risk-fixes-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260922-conversation-v1" />
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -59,17 +59,21 @@
                 <div class="panel-head">
                   <div>
                     <p class="eyebrow">Input</p>
-                    <h3>辩题参数</h3>
+                    <h3 id="startPanelTitle">辩题参数</h3>
                   </div>
                   <span id="runStatusBadge" class="status-badge">空闲中</span>
                 </div>
+                <div id="startModeSwitcher" class="start-mode-switcher" role="tablist" aria-label="启动模式">
+                  <button class="start-mode-button active" type="button" data-start-mode="debate" role="tab" aria-selected="true">模型辩论</button>
+                  <button class="start-mode-button" type="button" data-start-mode="conversation" role="tab" aria-selected="false">模型自由对话</button>
+                </div>
                 <form id="debateForm" class="debate-form" onsubmit="return false">
-                  <label>
+                  <label id="debateTopicField">
                     <span>辩题</span>
                     <textarea id="topicInput" rows="4" placeholder="输入这场辩论的主题，例如：生成式 AI 是否会显著提升中小企业效率？"></textarea>
                   </label>
                   <div id="homeDebaterBinding" class="home-binding-card"></div>
-                  <div class="form-grid">
+                  <div id="debateRoundFields" class="form-grid">
                     <label>
                       <span>最少轮数</span>
                       <input id="minRoundsInput" type="number" min="2" max="10" value="4" />
@@ -79,6 +83,20 @@
                       <input id="maxRoundsInput" type="number" min="2" max="10" value="6" />
                     </label>
                   </div>
+                  <section id="conversationStartFields" class="conversation-start-fields hidden">
+                    <label>
+                      <span>初始提示词</span>
+                      <textarea id="conversationPromptInput" rows="5" placeholder="输入一条提示词，模型会按顺序接力回复。"></textarea>
+                    </label>
+                    <div class="conversation-chain-head">
+                      <div>
+                        <span class="form-section-label">模型链路</span>
+                        <p class="card-note">模型会按从上到下的顺序依次接收上一位模型的输出。</p>
+                      </div>
+                      <button id="addConversationParticipantBtn" class="ghost-button compact-button" type="button">添加模型</button>
+                    </div>
+                    <div id="conversationParticipantList" class="conversation-participant-list"></div>
+                  </section>
                   <button id="startDebateBtn" class="launch-button" type="submit">开始辩论</button>
                 </form>
               </section>
@@ -93,7 +111,7 @@
           <section id="livePanel" class="panel live-panel hidden">
             <div class="panel-head stage-head">
               <div>
-                <p class="eyebrow">Live Debate</p>
+                <p id="livePanelEyebrow" class="eyebrow">Live Debate</p>
                 <h3 id="livePanelTitle">实时辩论中</h3>
               </div>
               <div class="stage-meta">
@@ -160,8 +178,8 @@
           <section id="reviewPanel" class="panel review-panel hidden">
             <div class="panel-head stage-head">
               <div>
-                <p class="eyebrow">Review</p>
-                <h3>辩论结果回看</h3>
+                <p id="reviewPanelEyebrow" class="eyebrow">Review</p>
+                <h3 id="reviewPanelTitle">辩论结果回看</h3>
               </div>
               <span id="reviewMeta" class="meta-text">已结束</span>
             </div>
@@ -193,7 +211,7 @@
                 <div class="panel-head review-transcript-head">
                   <div>
                     <p class="eyebrow">Transcript</p>
-                    <h3>辩论回放</h3>
+                    <h3 id="reviewTranscriptTitle">辩论回放</h3>
                   </div>
                 </div>
                 <div id="reviewThread" class="chat-thread review-thread"></div>
@@ -303,6 +321,6 @@
       </div>
     </div>
 
-    <script defer src="/assets/app.js?v=20260821-medium-risk-fixes-1"></script>
+    <script defer src="/assets/app.js?v=20260922-conversation-v1"></script>
   </body>
 </html>

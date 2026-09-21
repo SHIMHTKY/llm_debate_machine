@@ -122,6 +122,7 @@ class BaseSessionStore:
         if session is None:
             return None
         normalized = dict(session)
+        normalized.setdefault("kind", "debate")
         normalized.setdefault("messages", [])
         normalized.setdefault("live_status", None)
         normalized.setdefault("archived", False)
