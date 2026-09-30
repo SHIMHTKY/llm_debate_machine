@@ -1,6 +1,6 @@
 /* One version covers every stylesheet in the workbench release. */
-@import url("./styles/foundation.css?v=20260928-motion-4");
-@import url("./styles/workspace.css?v=20260928-motion-4");
-@import url("./styles/conversation.css?v=20260928-motion-4");
-@import url("./styles/configuration.css?v=20260928-motion-4");
-@import url("./styles/dialogs.css?v=20260928-motion-4");
+@import url("./styles/foundation.css?v=20260930-design-2");
+@import url("./styles/workspace.css?v=20260930-design-2");
+@import url("./styles/conversation.css?v=20260930-design-2");
+@import url("./styles/configuration.css?v=20260930-design-2");
+@import url("./styles/dialogs.css?v=20260930-design-2");

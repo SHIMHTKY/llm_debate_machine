@@ -1266,10 +1266,10 @@ function renderPresetManagerPanel(options = {}) {
   const routeChanged = els.presetManagerPanel.dataset.motionRoute !== motionRoute;
   els.presetManagerPanel.innerHTML = createPresetManagerOverlay();
   els.presetManagerPanel.classList.remove("hidden");
-  if (state.presetManagerEntering) uiMotion.reveal(els.presetManagerPanel, { fade: false });
+  if (state.presetManagerEntering) uiMotion.reveal(els.presetManagerPanel, { spring: true });
   else if (routeChanged) {
     const body = els.presetManagerPanel.querySelector(".preset-overlay-body, .response-flow-editor-body");
-    if (body) uiMotion.reveal(body, { fade: false });
+    if (body) uiMotion.reveal(body);
   }
   els.presetManagerPanel.dataset.motionRoute = motionRoute;
   const nextList = els.presetManagerPanel.querySelector(".preset-list");
@@ -2169,7 +2169,8 @@ function handleSettingsFormClick(event) {
   if (actionTarget.dataset.action === "toggle-utility-model-switcher") {
     state.utilityModelSwitcherOpen = !state.utilityModelSwitcherOpen;
     actionTarget.setAttribute("aria-expanded", state.utilityModelSwitcherOpen ? "true" : "false");
-    actionTarget.closest(".utility-model-switcher")?.querySelector(".utility-model-menu")?.classList.toggle("hidden", !state.utilityModelSwitcherOpen);
+    const menu = actionTarget.closest(".utility-model-switcher")?.querySelector(".utility-model-menu");
+    if (menu) uiMotion.popover(menu, state.utilityModelSwitcherOpen);
     return;
   }
   if (actionTarget.dataset.action === "switch-utility-model") {
@@ -3608,7 +3609,18 @@ function toggleEvaluationGroup(groupKey) {
     ...state.expandedEvaluationGroups,
     [groupKey]: !Boolean(state.expandedEvaluationGroups[groupKey]),
   };
-  renderEvaluationGroups(state.currentSession?.result?.evaluation || {});
+  const expanded = Boolean(state.expandedEvaluationGroups[groupKey]);
+
+  // Animate existing DOM node if available, otherwise full re-render
+  const groupEl = els.resultHighlights?.querySelector(`[data-evaluation-group="${CSS.escape(groupKey)}"]`);
+  if (groupEl) {
+    groupEl.classList.toggle("expanded", expanded);
+    groupEl.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const body = groupEl.querySelector(".highlight-group-body");
+    if (body) uiMotion.slideToggle(body, expanded);
+  } else {
+    renderEvaluationGroups(state.currentSession?.result?.evaluation || {});
+  }
 }
 
 function getOriginalTopicText(session) {
@@ -4139,7 +4151,10 @@ function renderLiveThread(session, messages, liveStatus) {
       changed = true;
     }
     if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null);
-    if (!existing && continuing) uiMotion.reveal(node, { offset: 6 });
+    if (!existing && continuing) {
+      node.classList.add("is-new");
+      requestAnimationFrame(() => node.classList.remove("is-new"));
+    }
     rows.set(item.key, { html: item.html, node });
   }
   const retained = new Set([...rows.values()].map(({ node }) => node));
@@ -4188,13 +4203,12 @@ function renderUserTargetControls() {
     els.toggleUserTargetMenuBtn.setAttribute("aria-expanded", expanded ? "true" : "false");
   }
   if (els.userTargetMenu) {
-    els.userTargetMenu.classList.toggle("hidden", !state.userTargetMenuOpen || state.userComposerDisabled);
+    const menuVisible = Boolean(state.userTargetMenuOpen && !state.userComposerDisabled);
+    uiMotion.popover(els.userTargetMenu, menuVisible, { origin: "bottom" });
   }
   if (els.userTargetSubmenu) {
-    els.userTargetSubmenu.classList.toggle(
-      "hidden",
-      !state.userTargetMenuOpen || !state.userTargetSubmenuOpen || state.userComposerDisabled,
-    );
+    const submenuVisible = Boolean(state.userTargetMenuOpen && state.userTargetSubmenuOpen && !state.userComposerDisabled);
+    uiMotion.popover(els.userTargetSubmenu, submenuVisible, { origin: "top" });
   }
   if (els.userTargetTagSlot) {
     const hasTarget = Boolean(targetLabel);
@@ -4359,7 +4373,8 @@ function renderReviewTopicPopover(session) {
     els.reviewTopicField.textContent = originalTopic;
   }
   if (els.reviewTopicDisclosure) {
-    els.reviewTopicDisclosure.classList.toggle("hidden", !canShowOriginalTopic || !state.reviewTopicExpanded);
+    const visible = Boolean(canShowOriginalTopic && state.reviewTopicExpanded);
+    uiMotion.popover(els.reviewTopicDisclosure, visible);
   }
 }
 

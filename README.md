@@ -21,6 +21,10 @@ LLM Debate Studio 是一个面向多模型自动辩论的本地可视化实验�
 
 建议使用 Python 3.10 或以上版本。
 
+Windows 用户安装依赖后，可以双击项目根目录的 `start.bat` 一键启动服务并打开浏览器。启动窗口保持打开，按 `Ctrl+C` 可停止本次启动的服务；已有服务运行时只打开页面，不重复启动。
+
+脚本自动查找项目 `.venv` / `venv`、当前 Conda 环境、常见安装位置的 `why_lldbm` 环境，以及 PATH 中已安装项目依赖的 Python。也可以用环境变量 `DEBATE_STUDIO_PYTHON` 指定 `python.exe` 的完整路径。脚本不会自动安装依赖或修改配置。
+
 ```powershell
 pip install -r requirements.txt
 python main.py
@@ -83,6 +87,9 @@ llm_debat_machine/
 ├─ data/            # 本地配置与辩论记录，默认不提交
 ├─ logs/            # 运行日志，默认不提交
 ├─ factory_reset.bat
+├─ start.bat        # Windows 一键启动入口
+├─ scripts/
+│  └─ start.py      # 环境检查、服务检测与浏览器启动
 ├─ main.py
 └─ requirements.txt
 ```
