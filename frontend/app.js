@@ -6,7 +6,6 @@
   system: "系统",
 };
 
-const MODAL_MOTION_MS = 180;
 const SESSION_SUMMARY_REFRESH_MS = 2000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 320;
 const DEFAULT_API_TIMEOUT_MS = 45000;
@@ -41,8 +40,8 @@ const CONFIG_MANAGER_TABS = [
 ];
 const UTILITY_MODEL_TABS = [
   { id: "judge", label: "裁判模型", note: "裁判也从供应商中选择接入信息，只在这里填写模型和裁判专属参数。", supplierLabel: "裁判供应商" },
-  { id: "translator", label: "翻译模型", note: "预留给后续翻译功能使用，配置方式与裁判模型一致，目前暂不参与辩论流程。", supplierLabel: "翻译供应商" },
-  { id: "summarizer", label: "总结模型", note: "预留给后续总结功能使用，配置方式与裁判模型一致，目前暂不参与辩论流程。", supplierLabel: "总结供应商" },
+  { id: "translator", label: "翻译模型", note: "用于翻译调用细节中的思考和工具结果，配置独立保存。", supplierLabel: "翻译供应商" },
+  { id: "summarizer", label: "总结模型", note: "用于总结调用细节中的思考和工具结果，配置独立保存。", supplierLabel: "总结供应商" },
 ];
 const MIN_DEBATE_ROUNDS = 2;
 const MAX_DEBATE_ROUNDS = 10;
@@ -71,7 +70,7 @@ const state = {
   responseFlowDraggingBlockId: "",
   expandedToolChoiceIds: {},
   noticeText: "",
-  workspaceText: "",
+  changelogController: null,
   darkMode: false,
   userComposerExpanded: false,
   stoppingSessionId: "",
@@ -79,7 +78,6 @@ const state = {
   sendingUserMessageSessionId: "",
   retractingUserMessageSessionId: "",
   rewindingMessageActionKey: "",
-  titleEditModalTimer: null,
   editingTitleSessionId: "",
   savingTitleSessionId: "",
   savingHomeBinding: false,
@@ -87,13 +85,9 @@ const state = {
   startDebateLocked: false,
   settingsSnapshot: null,
   settingsDarkModeSnapshot: false,
-  settingsModalTimer: null,
-  archivedModalTimer: null,
-  markdownPreviewModalTimer: null,
   markdownPreviewRequestId: 0,
   markdownPreviewController: null,
   markdownPreview: null,
-  messageDetailModalTimer: null,
   messageDetailLoadingKey: "",
   messageDetailTask: null,
   messageDetail: null,
@@ -111,10 +105,12 @@ const state = {
   userTargetSubmenuCloseTimer: null,
   userComposerDisabled: false,
   currentDebateMode: "",
+  renderedSessionId: "",
   presetManagerEntering: false,
 };
 
 const els = {};
+const liveThreadRenders = new WeakMap();
 
 window.addEventListener("DOMContentLoaded", init);
 
@@ -128,7 +124,6 @@ async function init() {
     ["会话", loadSessions],
     ["归档", loadArchivedSessions],
     ["须知", loadNotice],
-    ["工作区", loadWorkspace],
   ];
   const results = await Promise.allSettled(initialLoads.map(([, loader]) => loader()));
   renderCurrentSession();
@@ -205,7 +200,8 @@ function cacheElements() {
   els.landingPanel = document.getElementById("landingPanel");
   els.livePanel = document.getElementById("livePanel");
   els.reviewPanel = document.getElementById("reviewPanel");
-  els.workspaceViewer = document.getElementById("workspaceViewer");
+  els.changelogModal = document.getElementById("changelogModal");
+  els.changelogViewer = document.getElementById("changelogViewer");
   els.archivedList = document.getElementById("archivedList");
   els.appErrorToast = document.getElementById("appErrorToast");
   els.appErrorToastMessage = document.getElementById("appErrorToastMessage");
@@ -223,6 +219,11 @@ function bindEvents() {
   els.homeDebaterBinding?.addEventListener("change", handleHomeBindingChange);
   els.homeDebaterBinding?.addEventListener("click", handleHomeBindingClick);
   document.getElementById("settingsBtn").addEventListener("click", openSettings);
+  document.getElementById("openChangelogBtn").addEventListener("click", openChangelog);
+  document.getElementById("closeChangelogBtn").addEventListener("click", closeChangelog);
+  els.changelogModal.addEventListener("click", (event) => {
+    if (event.target === els.changelogModal) closeChangelog();
+  });
   document.getElementById("closeSettingsBtn").addEventListener("click", closeSettings);
   document.getElementById("saveSettingsBtn").addEventListener("click", saveSettings);
   els.newDebateBtn.addEventListener("click", openNewDebate);
@@ -465,16 +466,60 @@ async function loadNotice() {
   }
 }
 
-async function loadWorkspace() {
-  try {
-    const response = await fetchWithTimeout(`/assets/workspace.md?ts=${Date.now()}`, { timeoutMs: 15000 });
-    if (!response.ok) {
-      throw new Error("failed");
+function extractChangelog(markdown) {
+  const lines = String(markdown || "").replace(/^\uFEFF/, "").split(/\r?\n/);
+  const content = [];
+  let sectionLevel = 0;
+  let fence = "";
+  for (const line of lines) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (marker) {
+      if (!fence) fence = marker[1];
+      else if (marker[1][0] === fence[0] && marker[1].length >= fence.length) fence = "";
+    } else if (!fence) {
+      const heading = line.match(/^ {0,3}(#{1,6})[ \t]+(.+)$/);
+      if (heading) {
+        if (sectionLevel && heading[1].length <= sectionLevel) break;
+        if (!sectionLevel && /^更新(?:日志|记录)$/.test(heading[2].replace(/[ \t]+#+[ \t]*$/, "").trim())) {
+          sectionLevel = heading[1].length;
+          continue;
+        }
+      }
     }
-    state.workspaceText = (await response.text()).trim();
-  } catch {
-    state.workspaceText = "# Workspace\n- 请在 frontend/workspace.md 中维护这里的内容。";
+    if (sectionLevel) content.push(line);
   }
+  return content.join("\n").trim() || "暂无更新记录。";
+}
+
+async function openChangelog() {
+  state.changelogController?.abort();
+  const controller = new AbortController();
+  state.changelogController = controller;
+  els.changelogViewer.textContent = "正在读取更新记录...";
+  els.changelogViewer.setAttribute("aria-busy", "true");
+  els.changelogViewer.scrollTop = 0;
+  uiMotion.modal(els.changelogModal, true);
+  try {
+    const response = await fetchWithTimeout(`/assets/workspace.md?ts=${Date.now()}`, {
+      timeoutMs: 15000, cache: "no-store", signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const markdown = await response.text();
+    if (controller.signal.aborted || state.changelogController !== controller) return;
+    els.changelogViewer.innerHTML = renderMarkdown(extractChangelog(markdown));
+  } catch (error) {
+    if (!controller.signal.aborted && state.changelogController === controller) {
+      els.changelogViewer.textContent = `更新记录读取失败：${error.message}。请关闭后重试。`;
+    }
+  } finally {
+    if (state.changelogController === controller) els.changelogViewer.setAttribute("aria-busy", "false");
+  }
+}
+
+function closeChangelog() {
+  state.changelogController?.abort();
+  state.changelogController = null;
+  uiMotion.modal(els.changelogModal, false);
 }
 
 function readThemePreference() {
@@ -1079,19 +1124,15 @@ function openSettings() {
   state.utilityModelSwitcherOpen = false;
   ensurePresetManagerSelections();
   renderSettingsForm({ presetManagerOptions: { preserveListScroll: false, preserveEditorScroll: false } });
-  window.clearTimeout(state.settingsModalTimer);
-  els.settingsModal.classList.remove("hidden", "modal-leaving");
-  requestAnimationFrame(() => {
-    els.settingsModal.classList.add("modal-visible");
-  });
+  uiMotion.modal(els.settingsModal, true);
   loadNotice()
     .then((changed) => {
-      if (changed && !els.settingsModal.classList.contains("hidden")) {
+      if (changed && els.settingsModal.classList.contains("modal-visible")) {
         renderSettingsForm();
       }
     })
     .catch(() => {
-      if (!els.settingsModal.classList.contains("hidden")) {
+      if (els.settingsModal.classList.contains("modal-visible")) {
         renderSettingsForm();
       }
     });
@@ -1109,16 +1150,11 @@ function closeSettings(options = {}) {
     renderHomeDebaterBinding();
   }
   state.settingsSnapshot = null;
-  state.presetManagerOpen = false;
-  state.responseFlowEditorOpen = false;
-  renderPresetManagerPanel();
-  window.clearTimeout(state.settingsModalTimer);
-  els.settingsModal.classList.remove("modal-visible");
-  els.settingsModal.classList.add("modal-leaving");
-  state.settingsModalTimer = window.setTimeout(() => {
-    els.settingsModal.classList.add("hidden");
-    els.settingsModal.classList.remove("modal-leaving");
-  }, MODAL_MOTION_MS);
+  uiMotion.modal(els.settingsModal, false, { onHidden: () => {
+    state.presetManagerOpen = false;
+    state.responseFlowEditorOpen = false;
+    renderPresetManagerPanel();
+  } });
 }
 
 function openPresetManager(tab = "debater") {
@@ -1183,7 +1219,7 @@ function createThemeNoticeCard() {
         <div class="theme-toggle-row">
           <div>
             <strong class="theme-toggle-title">暗色模式</strong>
-            <p class="card-note theme-toggle-copy">开启后，整个前端会切换到蓝黑概念风格。</p>
+            <p class="card-note theme-toggle-copy">使用蓝黑配色，适合低光环境。</p>
           </div>
           <label class="theme-switch" aria-label="暗色模式开关">
             <input type="checkbox" data-ui-field="dark_mode" ${state.darkMode ? "checked" : ""} />
@@ -1226,9 +1262,16 @@ function renderPresetManagerPanel(options = {}) {
   const listScrollTop = preserveListScroll && existingList ? existingList.scrollTop : 0;
   const editorScrollTop = preserveEditorScroll && existingEditor ? existingEditor.scrollTop : 0;
   ensurePresetManagerSelections();
+  const motionRoute = state.responseFlowEditorOpen ? "flow" : state.presetManagerTab;
+  const routeChanged = els.presetManagerPanel.dataset.motionRoute !== motionRoute;
   els.presetManagerPanel.innerHTML = createPresetManagerOverlay();
-  els.presetManagerPanel.classList.toggle("preset-overlay-enter", state.presetManagerEntering);
   els.presetManagerPanel.classList.remove("hidden");
+  if (state.presetManagerEntering) uiMotion.reveal(els.presetManagerPanel, { fade: false });
+  else if (routeChanged) {
+    const body = els.presetManagerPanel.querySelector(".preset-overlay-body, .response-flow-editor-body");
+    if (body) uiMotion.reveal(body, { fade: false });
+  }
+  els.presetManagerPanel.dataset.motionRoute = motionRoute;
   const nextList = els.presetManagerPanel.querySelector(".preset-list");
   const nextEditor = els.presetManagerPanel.querySelector(".preset-editor-scroller");
   if (nextList) {
@@ -1398,7 +1441,7 @@ function renderHomeDebaterBinding() {
     <div class="home-binding-head">
       <div>
         <span class="form-section-label">辩手配置</span>
-        <p class="card-note">选择本场辩论使用的正方和反方模型，修改后会立即保存。</p>
+        <p class="card-note">为双方选择模型与回复流程。</p>
       </div>
       ${savingText}
     </div>
@@ -3082,24 +3125,14 @@ async function openSession(sessionId, shouldConnect, switchToDebate = true) {
 
 function openArchivedModal() {
   void loadArchivedSessions();
-  window.clearTimeout(state.archivedModalTimer);
-  els.archivedModal.classList.remove("hidden", "modal-leaving");
-  requestAnimationFrame(() => {
-    els.archivedModal.classList.add("modal-visible");
-  });
+  uiMotion.modal(els.archivedModal, true);
 }
 
 function closeArchivedModal() {
   if (els.archivedModal.classList.contains("hidden")) {
     return;
   }
-  window.clearTimeout(state.archivedModalTimer);
-  els.archivedModal.classList.remove("modal-visible");
-  els.archivedModal.classList.add("modal-leaving");
-  state.archivedModalTimer = window.setTimeout(() => {
-    els.archivedModal.classList.add("hidden");
-    els.archivedModal.classList.remove("modal-leaving");
-  }, MODAL_MOTION_MS);
+  uiMotion.modal(els.archivedModal, false);
 }
 
 async function archiveSession(sessionId) {
@@ -3553,25 +3586,18 @@ function handleUserTargetTagAction(event) {
     return;
   }
   const tag = els.userTargetTagSlot?.querySelector(".composer-target-tag");
-  if (!(tag instanceof HTMLElement) || tag.classList.contains("is-leaving")) {
+  if (!(tag instanceof HTMLElement)) {
     state.userMessageTargetRole = "";
     renderUserTargetControls();
     return;
   }
-  tag.classList.add("is-leaving");
-  let finalized = false;
-  const finalize = () => {
-    if (finalized) {
-      return;
-    }
-    finalized = true;
-    if (state.userMessageTargetRole) {
-      state.userMessageTargetRole = "";
-    }
-    renderUserTargetControls();
-  };
-  tag.addEventListener("animationend", finalize, { once: true });
-  window.setTimeout(finalize, 220);
+  if (tag.inert) return;
+  const returnFocus = tag.contains(document.activeElement);
+  state.userMessageTargetRole = "";
+  uiMotion.presence(tag, false, { onHidden: () => {
+    if (tag.isConnected) renderUserTargetControls();
+    if (returnFocus && document.activeElement === document.body) els.toggleUserTargetMenuBtn?.focus({ preventScroll: true });
+  } });
 }
 
 function toggleEvaluationGroup(groupKey) {
@@ -3677,6 +3703,7 @@ function getComposerExpandIconSvg(expanded) {
 function renderCurrentSession() {
   const session = state.currentSession;
   const mode = getDebateMode(session);
+  const changedView = mode !== state.currentDebateMode || (session?.id || "") !== state.renderedSessionId;
   els.debateView.classList.remove("mode-landing", "mode-live", "mode-review");
   els.debateView.classList.add(`mode-${mode}`);
   els.landingPanel.classList.toggle("hidden", mode !== "landing");
@@ -3691,7 +3718,12 @@ function renderCurrentSession() {
     renderReviewState(session);
   }
 
+  if (changedView) {
+    uiMotion.reveal(mode === "landing" ? els.landingPanel : mode === "live" ? els.livePanel : els.reviewPanel, { fade: false });
+  }
+
   state.currentDebateMode = mode;
+  state.renderedSessionId = session?.id || "";
   syncCurrentSessionSummary();
   renderSessions();
   scheduleSessionSummaryRefresh();
@@ -3720,18 +3752,12 @@ function openTitleEditModal() {
     return;
   }
   state.editingTitleSessionId = session.id;
-  window.clearTimeout(state.titleEditModalTimer);
   if (els.titleEditInput) {
     els.titleEditInput.value = getSessionDisplayTitle(session, session.topic);
   }
-  els.titleEditModal.classList.remove("hidden", "modal-leaving");
-  requestAnimationFrame(() => {
-    els.titleEditModal.classList.add("modal-visible");
-    if (els.titleEditInput) {
-      els.titleEditInput.focus();
-      els.titleEditInput.select();
-    }
-  });
+  uiMotion.modal(els.titleEditModal, true);
+  els.titleEditInput?.focus({ preventScroll: true });
+  els.titleEditInput?.select();
 }
 
 function closeTitleEditModal(options = {}) {
@@ -3739,18 +3765,7 @@ function closeTitleEditModal(options = {}) {
   if (!els.titleEditModal || els.titleEditModal.classList.contains("hidden")) {
     return;
   }
-  window.clearTimeout(state.titleEditModalTimer);
-  if (options.immediate) {
-    els.titleEditModal.classList.add("hidden");
-    els.titleEditModal.classList.remove("modal-visible", "modal-leaving");
-    return;
-  }
-  els.titleEditModal.classList.remove("modal-visible");
-  els.titleEditModal.classList.add("modal-leaving");
-  state.titleEditModalTimer = window.setTimeout(() => {
-    els.titleEditModal.classList.add("hidden");
-    els.titleEditModal.classList.remove("modal-leaving");
-  }, MODAL_MOTION_MS);
+  uiMotion.modal(els.titleEditModal, false, { immediate: Boolean(options.immediate) });
 }
 
 function handleTitleEditKeydown(event) {
@@ -4057,17 +4072,7 @@ function renderLandingState() {
   state.togglingPauseSessionId = "";
   state.sendingUserMessageSessionId = "";
   state.retractingUserMessageSessionId = "";
-  renderWorkspace();
   renderInlineErrorToast();
-}
-
-function renderWorkspace() {
-  if (!els.workspaceViewer) {
-    return;
-  }
-  els.workspaceViewer.innerHTML = renderMarkdown(state.workspaceText || "# Workspace\n- 暂无内容。");
-  els.workspaceViewer.classList.remove("empty-viewer");
-  els.workspaceViewer.scrollTop = 0;
 }
 
 function renderLiveState(session) {
@@ -4082,7 +4087,6 @@ function renderLiveState(session) {
   const activeUserMessage = getActiveUserMessage(session);
   const liveStatus = state.typing || session.live_status || null;
   const messages = [...(session.messages || [])];
-  const latestMessageId = messages.length ? messages[messages.length - 1].id : "";
   if (els.livePanelTitle) {
     els.livePanelTitle.textContent = isPaused ? "辩论已暂停" : "实时辩论中";
   }
@@ -4100,15 +4104,7 @@ function renderLiveState(session) {
     : (isToggling ? (isPaused ? "正在继续辩论..." : "正在暂停辩论...") : statusText);
   setRunningState(isRunningSessionStatus(session.status), operationText);
 
-  const parts = messages.map((message) => renderMessageRow(message, session, { animate: message.id === latestMessageId }));
-  if (liveStatus) {
-    parts.push(renderTypingRow(liveStatus, session, { animate: true }));
-  }
-  if (!parts.length) {
-    parts.push('<div class="empty-state">辩论准备中，消息会在这里实时展开。</div>');
-  }
-  els.chatThread.innerHTML = parts.join("");
-  scrollThreadToBottom(els.chatThread, true);
+  renderLiveThread(session, messages, liveStatus);
   renderQueuedUserMessage(activeUserMessage, { disabled: isRetracting });
   renderUserComposer(session, {
     isPaused,
@@ -4117,6 +4113,41 @@ function renderLiveState(session) {
     isRetracting,
     activeUserMessage,
   });
+}
+
+function renderLiveThread(session, messages, liveStatus) {
+  const container = els.chatThread;
+  const previous = liveThreadRenders.get(container);
+  const sameSession = previous?.sessionId === session.id;
+  const continuing = sameSession && state.currentDebateMode === "live";
+  const followLatest = !continuing || container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+  const items = messages.map((message, index) => ({
+    key: `message:${message.id || index}`, html: renderMessageRow(message, session),
+  }));
+  if (liveStatus) items.push({ key: "typing", html: renderTypingRow(liveStatus, session) });
+  if (!items.length) items.push({ key: "empty", html: '<div class="empty-state">辩论准备中，消息会在这里实时展开。</div>' });
+  const rows = new Map();
+  let changed = !sameSession;
+  for (const [index, item] of items.entries()) {
+    const existing = sameSession ? previous.rows.get(item.key) : null;
+    let node = existing?.node;
+    if (!node || existing.html !== item.html) {
+      const template = document.createElement("template");
+      template.innerHTML = item.html.trim();
+      node = template.content.firstElementChild;
+      if (existing) existing.node.replaceWith(node);
+      changed = true;
+    }
+    if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null);
+    if (!existing && continuing) uiMotion.reveal(node, { offset: 6 });
+    rows.set(item.key, { html: item.html, node });
+  }
+  const retained = new Set([...rows.values()].map(({ node }) => node));
+  for (const child of [...container.children]) {
+    if (!retained.has(child)) { child.remove(); changed = true; }
+  }
+  liveThreadRenders.set(container, { sessionId: session.id, rows });
+  if (followLatest && (changed || !continuing)) scrollThreadToBottom(container, continuing);
 }
 
 function renderQueuedUserMessage(activeUserMessage, options = {}) {
@@ -4395,7 +4426,7 @@ function scrollThreadToBottom(container, smooth = false) {
     return;
   }
   const top = container.scrollHeight;
-  if (smooth && typeof container.scrollTo === "function") {
+  if (smooth && !uiMotion.reduced() && typeof container.scrollTo === "function") {
     container.scrollTo({ top, behavior: "smooth" });
     return;
   }
@@ -4469,7 +4500,7 @@ function getRoleDisplayLabel(messageOrStatus, session) {
   return modelName ? `${baseLabel} · ${modelName}` : baseLabel;
 }
 
-function renderMessageRow(message, session, options = {}) {
+function renderMessageRow(message, session) {
   let position = "center";
   let variant = "summary";
   if (message.role === "pro") {
@@ -4494,7 +4525,6 @@ function renderMessageRow(message, session, options = {}) {
     ? stripDebateMarkdownStructure(rawContent)
     : rawContent;
   const targetBadge = message.role === "user" ? getUserTargetBadge(message.target_role) : "";
-  const animateClass = options.animate ? " entering" : "";
   const retractable = message.role === "user" && session?.status === "paused" && !message.locked && getActiveUserMessage(session)?.id === message.id;
   const roundLabel = message.round ? `第 ${message.round} 轮` : "";
   const timestampParts = formatMessageTimestamp(message.timestamp);
@@ -4559,7 +4589,7 @@ function renderMessageRow(message, session, options = {}) {
   return `
     <div class="${rowClass}">
       <div class="message-bubble-group">
-        <article class="message-card ${variant}${animateClass}">
+        <article class="message-card ${variant}">
           <div class="message-head${headMetaHtml ? " has-meta" : ""}">
             <div class="message-head-main${message.role === "user" ? " user-message-head-main" : ""}${message.role === "judge" ? " judge-message-head-main" : ""}">
               <span class="message-label">${escapeHtml(displayLabel)}</span>
@@ -4583,12 +4613,11 @@ function renderMessageRow(message, session, options = {}) {
   `;
 }
 
-function renderTypingRow(status, session, options = {}) {
+function renderTypingRow(status, session) {
   const displayLabel = getRoleDisplayLabel(status, session);
-  const animateClass = options.animate ? " entering" : "";
   return `
     <div class="message-row center">
-      <div class="typing-card${animateClass}">
+      <div class="typing-card">
         <strong>${escapeHtml(displayLabel)}</strong>
         <span>${escapeHtml(status.content || "思考中")}</span>
         <span class="typing-dots"><span></span><span></span><span></span></span>
@@ -4764,9 +4793,7 @@ function showMarkdownPreviewShell(kind, sessionId) {
     content: "",
     fileName: "",
   };
-  window.clearTimeout(state.markdownPreviewModalTimer);
-  els.markdownPreviewModal.classList.remove("hidden", "modal-leaving");
-  els.markdownPreviewModal.classList.add("modal-visible");
+  uiMotion.modal(els.markdownPreviewModal, true);
   els.markdownPreviewEyebrow.textContent = meta.eyebrow;
   els.markdownPreviewTitle.textContent = meta.title;
   els.markdownPreviewViewer.classList.add("empty-viewer");
@@ -4827,18 +4854,7 @@ function closeMarkdownPreviewModal({ immediate = false } = {}) {
   state.markdownPreviewController = null;
   state.markdownPreview = null;
   els.downloadMarkdownPreviewBtn.disabled = true;
-  window.clearTimeout(state.markdownPreviewModalTimer);
-  if (immediate) {
-    els.markdownPreviewModal.classList.add("hidden");
-    els.markdownPreviewModal.classList.remove("modal-visible", "modal-leaving");
-    return;
-  }
-  els.markdownPreviewModal.classList.remove("modal-visible");
-  els.markdownPreviewModal.classList.add("modal-leaving");
-  state.markdownPreviewModalTimer = window.setTimeout(() => {
-    els.markdownPreviewModal.classList.add("hidden");
-    els.markdownPreviewModal.classList.remove("modal-leaving");
-  }, MODAL_MOTION_MS);
+  uiMotion.modal(els.markdownPreviewModal, false, { immediate });
 }
 
 function triggerMarkdownDownload(content, fileName) {
@@ -5259,9 +5275,7 @@ function renderDetailTextTaskBar() {
   }
   const task = state.messageDetailTask;
   if (!task) {
-    els.detailTextTaskBar.classList.add("hidden");
-    els.detailTextTaskBar.classList.remove("visible");
-    els.detailTextTaskLabel.textContent = "";
+    uiMotion.presence(els.detailTextTaskBar, false, { onHidden: () => { els.detailTextTaskLabel.textContent = ""; } });
     if (els.cancelDetailTextTaskBtn) {
       els.cancelDetailTextTaskBtn.disabled = false;
     }
@@ -5271,12 +5285,7 @@ function renderDetailTextTaskBar() {
   if (els.cancelDetailTextTaskBtn) {
     els.cancelDetailTextTaskBtn.disabled = Boolean(task.cancelling);
   }
-  els.detailTextTaskBar.classList.remove("hidden");
-  window.requestAnimationFrame(() => {
-    if (state.messageDetailTask === task) {
-      els.detailTextTaskBar.classList.add("visible");
-    }
-  });
+  uiMotion.presence(els.detailTextTaskBar, true);
 }
 
 function clearMessageDetailTextTask(task) {
@@ -5438,9 +5447,7 @@ function openMessageDetails(messageId) {
     sessionId: state.currentSession?.id || "",
     activeViews: {},
   };
-  window.clearTimeout(state.messageDetailModalTimer);
-  els.messageDetailModal.classList.remove("hidden", "modal-leaving");
-  els.messageDetailModal.classList.add("modal-visible");
+  uiMotion.modal(els.messageDetailModal, true);
   els.messageDetailEyebrow.textContent = "Call Details";
   els.messageDetailTitle.textContent = "模型调用细节";
   els.messageDetailBody.innerHTML = renderMessageDetails(message, state.currentSession);
@@ -5448,19 +5455,8 @@ function openMessageDetails(messageId) {
 }
 
 function closeMessageDetailModal({ immediate = false } = {}) {
-  window.clearTimeout(state.messageDetailModalTimer);
   state.messageDetail = null;
-  if (immediate) {
-    els.messageDetailModal.classList.add("hidden");
-    els.messageDetailModal.classList.remove("modal-visible", "modal-leaving");
-    return;
-  }
-  els.messageDetailModal.classList.remove("modal-visible");
-  els.messageDetailModal.classList.add("modal-leaving");
-  state.messageDetailModalTimer = window.setTimeout(() => {
-    els.messageDetailModal.classList.add("hidden");
-    els.messageDetailModal.classList.remove("modal-leaving");
-  }, MODAL_MOTION_MS);
+  uiMotion.modal(els.messageDetailModal, false, { immediate });
 }
 
 async function downloadSessionExport(kind) {
@@ -5499,8 +5495,8 @@ function renderInlineErrorToast() {
   if (!els.appErrorToast || !els.appErrorToastMessage) {
     return;
   }
-  els.appErrorToastMessage.textContent = state.inlineError;
-  els.appErrorToast.classList.toggle("hidden", !state.inlineError);
+  if (state.inlineError) els.appErrorToastMessage.textContent = state.inlineError;
+  uiMotion.presence(els.appErrorToast, Boolean(state.inlineError));
 }
 
 function parseErrorRecord(markdown) {

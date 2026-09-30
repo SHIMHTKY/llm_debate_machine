@@ -4,21 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Debate Studio</title>
-    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=20260326-favicon" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260821-medium-risk-fixes-1" />
+    <meta name="theme-color" content="#f5f6f8" />
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=20260928-motion-4" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260928-motion-4" />
   </head>
   <body>
-    <div class="ambient ambient-a"></div>
-    <div class="ambient ambient-b"></div>
-    <div class="ambient ambient-c"></div>
-
     <div class="app-shell">
-      <aside class="sidebar panel">
+      <a class="skip-link" href="#workspaceMain">跳到主工作区</a>
+      <aside id="sessionSidebar" class="sidebar panel" aria-label="历史辩论">
         <div class="brand-block">
-          <p class="eyebrow">Visual Debate Studio</p>
-          <h1>LLM 辩论台</h1>
-          <p class="sidebar-copy">历史辩论会在这里沉淀，点击即可回看，右侧删除。</p>
+          <img class="brand-mark" src="/assets/favicon.svg?v=20260928-motion-4" alt="" width="32" height="32" />
+          <div><h1>LLM 辩论台</h1><p class="eyebrow">DEBATE / STUDIO</p></div>
+          <button id="closeSidebarBtn" class="sidebar-close icon-button" type="button" aria-label="收起历史侧栏" title="收起历史侧栏">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5" /></svg>
+          </button>
         </div>
+        <div class="sidebar-section-label"><span>会话档案</span><span class="mono-label">HISTORY</span></div>
         <div class="sidebar-header">
           <span>历史记录</span>
           <div class="sidebar-actions">
@@ -27,12 +28,17 @@
           </div>
         </div>
         <div id="historyList" class="history-list"></div>
+        <div class="sidebar-footer"><span class="mono-label">LOCAL WORKSPACE</span><span>会话与配置 · 本地存储</span></div>
       </aside>
+      <button id="sidebarBackdrop" class="sidebar-backdrop" type="button" aria-label="收起历史侧栏" tabindex="-1"></button>
 
-      <main class="workspace">
+      <main id="workspaceMain" class="workspace" tabindex="-1">
         <header class="topbar panel">
+          <button id="toggleSidebarBtn" class="sidebar-toggle icon-button" type="button" aria-controls="sessionSidebar" aria-expanded="true" aria-label="收起历史侧栏" title="收起历史侧栏">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="1" /><path d="M9 4v16" /><path class="sidebar-toggle-chevron" d="m15 9-3 3 3 3" /></svg>
+          </button>
           <div class="topbar-copy">
-            <p class="eyebrow">Concept UI</p>
+            <p class="eyebrow">DEBATE CONSOLE</p>
             <h2 id="currentHeadline">开始一场新的模型辩论</h2>
           </div>
           <div class="utility-dock" aria-label="快捷入口">
@@ -54,40 +60,39 @@
 
         <section id="debateView" class="view view-active debate-view mode-landing">
           <section id="landingPanel" class="landing-panel">
-            <div class="hero-grid">
-              <section class="panel control-panel">
-                <div class="panel-head">
-                  <div>
-                    <p class="eyebrow">Input</p>
-                    <h3>辩题参数</h3>
+              <section class="control-panel">
+                <div class="panel-head setup-heading">
+                  <div class="setup-title">
+                    <h3>辩论设置</h3>
+                    <span id="runStatusBadge" class="status-badge">空闲中</span>
                   </div>
-                  <span id="runStatusBadge" class="status-badge">空闲中</span>
+                  <button id="openChangelogBtn" class="changelog-button ghost-button compact-button" type="button" aria-haspopup="dialog" aria-controls="changelogModal">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.6 7M3 4v7h7M12 7v5l3 2" /></svg>
+                    <span>更新记录</span>
+                  </button>
                 </div>
                 <form id="debateForm" class="debate-form" onsubmit="return false">
-                  <label>
-                    <span>辩题</span>
-                    <textarea id="topicInput" rows="4" placeholder="输入这场辩论的主题，例如：生成式 AI 是否会显著提升中小企业效率？"></textarea>
+                  <label class="topic-field">
+                    <span>辩题 <small class="field-caption">TOPIC</small></span>
+                    <textarea id="topicInput" rows="5" placeholder="输入一个值得交锋的问题，例如：生成式 AI 是否会显著提升中小企业效率？"></textarea>
                   </label>
                   <div id="homeDebaterBinding" class="home-binding-card"></div>
-                  <div class="form-grid">
-                    <label>
-                      <span>最少轮数</span>
-                      <input id="minRoundsInput" type="number" min="2" max="10" value="4" />
-                    </label>
-                    <label>
-                      <span>最多轮数</span>
-                      <input id="maxRoundsInput" type="number" min="2" max="10" value="6" />
-                    </label>
+                  <div class="debate-launch-row">
+                    <div class="form-grid round-inputs">
+                      <label>
+                        <span>最少轮数</span>
+                        <input id="minRoundsInput" type="number" min="2" max="10" value="4" />
+                      </label>
+                      <label>
+                        <span>最多轮数</span>
+                        <input id="maxRoundsInput" type="number" min="2" max="10" value="6" />
+                      </label>
+                    </div>
+                    <button id="startDebateBtn" class="launch-button" type="submit">开始辩论</button>
                   </div>
-                  <button id="startDebateBtn" class="launch-button" type="submit">开始辩论</button>
+                  <p class="form-footnote">双方轮流发言，裁判总结评议。开始后可随时暂停或插入你的观点。</p>
                 </form>
               </section>
-
-              <section class="panel insight-panel">
-                <p class="eyebrow">Workspace</p>
-                <div id="workspaceViewer" class="record-viewer workspace-viewer empty-viewer">正在读取 frontend/workspace.md ...</div>
-              </section>
-            </div>
           </section>
 
           <section id="livePanel" class="panel live-panel hidden">
@@ -223,6 +228,18 @@
       </div>
     </div>
 
+    <div id="changelogModal" class="modal hidden">
+      <div class="modal-card changelog-modal-card panel">
+        <div class="panel-head modal-head">
+          <div><p class="eyebrow">RELEASE NOTES</p><h3>更新记录</h3></div>
+          <button id="closeChangelogBtn" class="ghost-button compact-button" type="button">关闭</button>
+        </div>
+        <div class="changelog-frame">
+          <div id="changelogViewer" class="record-viewer changelog-viewer" aria-live="polite"></div>
+        </div>
+      </div>
+    </div>
+
     <div id="messageDetailModal" class="modal hidden">
       <div class="modal-card message-detail-modal-card panel">
         <div class="message-detail-toolbar">
@@ -253,7 +270,7 @@
       <div class="modal-card panel">
         <div class="panel-head modal-head">
           <div>
-            <p class="eyebrow">Soft Config</p>
+            <p class="eyebrow">SYSTEM / CONFIGURATION</p>
             <h3>模型与工具设置</h3>
           </div>
           <div class="topbar-actions">
@@ -262,7 +279,7 @@
           </div>
         </div>
                 <div id="settingsForm" class="settings-grid"></div>
-        <div id="presetManagerPanel" class="preset-overlay hidden"></div>
+        <div id="presetManagerPanel" class="preset-overlay hidden" aria-label="模型与工具配置"></div>
       </div>
     </div>
     <div id="archivedModal" class="modal hidden">
@@ -277,7 +294,7 @@
           </div>
         </div>
         <div class="archived-modal-body">
-          <div class="archived-modal-note">这里保留已归档的 simple 记录。点击可查看，或直接恢复、永久删除。</div>
+          <div class="archived-modal-note">已归档的辩论仍可回放、恢复或永久删除。</div>
           <div id="archivedList" class="archived-list"></div>
         </div>
       </div>
@@ -303,6 +320,8 @@
       </div>
     </div>
 
-    <script defer src="/assets/app.js?v=20260821-medium-risk-fixes-1"></script>
+    <script defer src="/assets/motion.js?v=20260928-motion-4"></script>
+    <script defer src="/assets/app.js?v=20260928-motion-4"></script>
+    <script defer src="/assets/shell.js?v=20260928-motion-4"></script>
   </body>
 </html>
